@@ -1,0 +1,24 @@
+[Unit]
+Description=PDF Text Style Editor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pdfeditor
+Group=pdfeditor
+WorkingDirectory=/opt/pdf-text-editor
+Environment=PYTHONUNBUFFERED=1
+Environment=PDF_EDITOR_HOST=127.0.0.1
+Environment=PDF_EDITOR_PORT=8000
+ExecStart=/opt/pdf-text-editor/.venv/bin/python /opt/pdf-text-editor/main.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

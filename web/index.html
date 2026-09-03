@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PDF Text Style Editor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <section id="loginView" class="login-view">
+    <form id="loginForm" class="login-panel" autocomplete="on">
+      <div class="login-brand">
+        <div class="brand-mark">PDF</div>
+        <div>
+          <strong>PDF Text Style Editor</strong>
+          <span>Login</span>
+        </div>
+      </div>
+      <label for="loginUsername">User name</label>
+      <input id="loginUsername" name="username" type="text" autocomplete="username" required autofocus />
+      <label for="loginPassword">Password</label>
+      <input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
+      <button class="btn primary large" type="submit">Login</button>
+      <div id="loginError" class="login-error hidden"></div>
+    </form>
+  </section>
+
+  <div id="appShell" class="app-shell hidden">
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">PDF</div>
+        <div>
+          <strong>PDF Text Style Editor</strong>
+          <span>Browser Edition</span>
+        </div>
+      </div>
+      <div class="top-actions">
+        <button id="makeUserBtn" class="btn admin-only hidden">Make User</button>
+        <button id="allUsersBtn" class="btn admin-only hidden">All Users</button>
+        <button id="openPdfBtn" class="btn primary">Open PDF</button>
+        <button id="loadDocxBtn" class="btn">Load DOCX Reference</button>
+        <button id="saveBtn" class="btn" disabled>Save As</button>
+        <button id="undoBtn" class="btn" disabled>Undo Last</button>
+        <button id="fullscreenBtn" class="btn">Full Screen</button>
+        <span id="userBadge" class="user-badge"></span>
+        <button id="logoutBtn" class="btn">Logout</button>
+      </div>
+    </header>
+
+    <div class="subbar">
+      <div class="page-controls">
+        <button id="prevBtn" class="btn compact" disabled>◀ Previous</button>
+        <span id="pageLabel">No PDF</span>
+        <button id="nextBtn" class="btn compact" disabled>Next ▶</button>
+      </div>
+      <div class="zoom-controls">
+        <span id="zoomLabel">Zoom 135%</span>
+        <input id="zoomSlider" type="range" min="60" max="250" value="135" />
+      </div>
+    </div>
+
+    <div id="docxLabel" class="docx-banner">DOCX reference: not loaded</div>
+
+    <main class="workspace">
+      <section class="viewer-panel">
+        <div id="emptyState" class="empty-state">
+          <div class="empty-icon">PDF</div>
+          <h2>Open a PDF to begin</h2>
+          <p>Your existing PyMuPDF editing engine runs on the server. The browser is only the interface.</p>
+          <button id="emptyOpenBtn" class="btn primary">Choose PDF</button>
+        </div>
+        <div id="pageScroller" class="page-scroller hidden">
+          <div id="pageStage" class="page-stage">
+            <img id="pageImage" alt="PDF page" draggable="false" />
+            <div id="selectionBox" class="selection-box hidden"></div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <div class="inspector-heading">
+          <h2>Selected Text — V3.19</h2>
+          <p>PDF remains the final document. DOCX is an optional human-readable font reference.</p>
+        </div>
+
+        <div class="notice success">
+          <strong>STRICT STYLE MODE</strong>
+          <span>No font-size resizing and no unrelated font substitution.</span>
+        </div>
+
+        <section class="card">
+          <h3>PDF formatting</h3>
+          <div class="field wide">
+            <label>Text</label>
+            <textarea id="originalText" readonly></textarea>
+          </div>
+          <div class="info-grid">
+            <label>Internal font</label><span id="pdfFont">-</span>
+            <label>PDF style</label><span id="pdfStyle">-</span>
+            <label>Exact size</label><span id="pdfSize">-</span>
+            <label>Color</label><span id="pdfColor">-</span>
+            <label>Position</label><span id="pdfPosition">-</span>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3>DOCX font identification</h3>
+          <div class="info-grid">
+            <label>Family used</label><span id="docxFamily">-</span>
+            <label>Declared/alias</label><span id="docxDeclared">-</span>
+            <label>DOCX size</label><span id="docxSize">-</span>
+            <label>Weight</label><span id="docxWeight">-</span>
+            <label>Italic</label><span id="docxItalic">-</span>
+            <label>Match confidence</label><span id="docxConfidence" class="pill">DOCX not loaded — PDF-only mode</span>
+            <label>Why selected</label><span id="docxReason">-</span>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3>Font used for replacement</h3>
+          <div class="info-grid">
+            <label>Mode</label><span id="fontMode">Automatic</span>
+            <label>Family</label><span id="resolvedFamily">-</span>
+            <label>Face</label><span id="resolvedFace">-</span>
+            <label>Weight</label><span id="resolvedWeight">-</span>
+            <label>Source</label><span id="resolvedSource" class="prewrap">-</span>
+          </div>
+        </section>
+
+        <section class="card replacement-card">
+          <h3>Replacement</h3>
+          <label for="newText">New text</label>
+          <textarea id="newText" placeholder="Enter replacement text..." disabled></textarea>
+          <div class="stack-actions">
+            <button id="loadFontBtn" class="btn" disabled>Load Exact TTF/OTF Font...</button>
+            <button id="findFontBtn" class="btn" disabled>Find Exact Font Online...</button>
+            <button id="checkBtn" class="btn" disabled>Re-check Font Match</button>
+          </div>
+          <div id="matchStatus" class="notice neutral prewrap">Select text to begin.</div>
+          <button id="replaceBtn" class="btn primary large" disabled>Replace Text (Clean)</button>
+        </section>
+
+        <div class="notice warning small-note">
+          V3.19 browser UI reuses the existing PDF, font, DOCX, validation and export modules. Browser sessions are temporary and the source PDF is not overwritten.
+        </div>
+
+        <div id="status" class="status">Open a PDF to begin.</div>
+        <div id="exportExtras" class="export-extras hidden">
+          <button id="auditBtn" class="btn compact">Audit Log</button>
+          <button id="validationBtn" class="btn compact">Validation</button>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <input id="pdfInput" type="file" accept="application/pdf,.pdf" hidden />
+  <input id="docxInput" type="file" accept=".docx,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden />
+  <input id="fontInput" type="file" accept=".ttf,.otf,font/ttf,font/otf" hidden />
+
+  <div id="userModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+      <div class="modal-heading">
+        <h2 id="userModalTitle">Make User</h2>
+        <button id="closeUserModalBtn" class="btn compact" type="button">Close</button>
+      </div>
+
+      <form id="createUserForm" class="user-form">
+        <label for="newUsername">User name</label>
+        <input id="newUsername" type="text" autocomplete="off" required />
+        <label for="newUserPassword">Password</label>
+        <input id="newUserPassword" type="password" autocomplete="new-password" required />
+        <button class="btn primary large" type="submit">Create User</button>
+      </form>
+
+      <div id="userListView" class="user-list hidden">
+        <div id="userListStatus" class="status">Loading users...</div>
+        <div id="userListRows" class="user-list-rows"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <div id="busy" class="busy hidden"><div class="spinner"></div><span>Working…</span></div>
+
+  <script src="/static/editor.js"></script>
+</body>
+</html>
