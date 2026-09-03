@@ -17,16 +17,14 @@ Open:
 http://127.0.0.1:8000
 ```
 
-The first screen is a login page. MongoDB settings and the initial admin login are read from `.env`:
+The first screen is a login page. MongoDB connection settings are read from `.env`:
 
 ```text
 MONGO_URI=...
 MONGO_DB_NAME=pdf_text_browser
-ADMIN_USERNAME=...
-ADMIN_PASSWORD=...
 ```
 
-Admins see `Make User` and `All Users` buttons in the editor toolbar. New users created there are normal users and only see the PDF tool after login.
+Login users are read from the MongoDB `users` collection. A document with `role: "admin"` sees `Make User` and `All Users` in the editor toolbar. Normal users only see the PDF tool after login.
 
 The server listens on `0.0.0.0:8000` by default. Change it with:
 

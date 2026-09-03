@@ -64,8 +64,6 @@ MONGO_CONNECT_RETRIES = int(os.environ.get("MONGO_CONNECT_RETRIES", "3"))
 MONGO_SERVER_SELECTION_TIMEOUT_MS = int(
     os.environ.get("MONGO_SERVER_SELECTION_TIMEOUT_MS", "10000")
 )
-ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
 PASSWORD_ITERATIONS = 260_000
 
 
@@ -118,12 +116,17 @@ def _clean_username(username: str) -> str:
     return (username or "").strip()
 
 
-def _password_digest(password: str, salt: str) -> str:
+def _clean_role(role: Any) -> str:
+    value = str(role or "user").strip().lower()
+    return value or "user"
+
+
+def _password_digest(password: str, salt: str, iterations: int = PASSWORD_ITERATIONS) -> str:
     return hashlib.pbkdf2_hmac(
         "sha256",
         password.encode("utf-8"),
         salt.encode("utf-8"),
-        PASSWORD_ITERATIONS,
+        iterations,
     ).hex()
 
 
@@ -139,10 +142,16 @@ def _password_fields(password: str) -> dict[str, Any]:
 def _verify_password(password: str, user: dict[str, Any]) -> bool:
     salt = user.get("password_salt")
     stored = user.get("password_hash")
-    if not salt or not stored:
-        return False
-    digest = _password_digest(password, salt)
-    return hmac.compare_digest(digest, stored)
+    if salt and stored:
+        iterations = int(user.get("password_iterations") or PASSWORD_ITERATIONS)
+        digest = _password_digest(password, salt, iterations)
+        return hmac.compare_digest(digest, stored)
+
+    mongo_password = user.get("password")
+    if isinstance(mongo_password, str):
+        return hmac.compare_digest(password, mongo_password)
+
+    return False
 
 
 def _public_user(user: dict[str, Any]) -> dict[str, Any]:
@@ -155,7 +164,7 @@ def _public_user(user: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(user.get("_id", "")),
         "username": user.get("username", ""),
-        "role": user.get("role", "user"),
+        "role": _clean_role(user.get("role")),
         "created_at": created_at_value,
     }
 
@@ -168,8 +177,6 @@ class AuthStore:
             )
         if not MONGO_URI:
             raise RuntimeError("MONGO_URI is not set in the environment.")
-        if not ADMIN_USERNAME or not ADMIN_PASSWORD:
-            raise RuntimeError("ADMIN_USERNAME and ADMIN_PASSWORD must be set.")
 
         last_error: PyMongoError | None = None
         for attempt in range(max(1, MONGO_CONNECT_RETRIES)):
@@ -181,7 +188,6 @@ class AuthStore:
                 self.client.admin.command("ping")
                 self.users = self.client[MONGO_DB_NAME]["users"]
                 self.users.create_index([("username", ASCENDING)], unique=True)
-                self.ensure_admin_user()
                 return
             except PyMongoError as exc:
                 last_error = exc
@@ -189,25 +195,6 @@ class AuthStore:
                     time.sleep(0.75)
 
         raise RuntimeError(f"Could not connect to MongoDB: {last_error}")
-
-    def ensure_admin_user(self):
-        now = _utc_now()
-        fields = _password_fields(ADMIN_PASSWORD)
-        self.users.update_one(
-            {"username": ADMIN_USERNAME},
-            {
-                "$set": {
-                    "role": "admin",
-                    "updated_at": now,
-                    **fields,
-                },
-                "$setOnInsert": {
-                    "username": ADMIN_USERNAME,
-                    "created_at": now,
-                },
-            },
-            upsert=True,
-        )
 
     def authenticate(self, username: str, password: str) -> dict[str, Any] | None:
         username = _clean_username(username)
@@ -241,7 +228,15 @@ class AuthStore:
         return user
 
     def list_users(self) -> list[dict[str, Any]]:
-        users = self.users.find({}, {"password_hash": 0, "password_salt": 0}).sort(
+        users = self.users.find(
+            {},
+            {
+                "password": 0,
+                "password_hash": 0,
+                "password_salt": 0,
+                "password_iterations": 0,
+            },
+        ).sort(
             [("role", ASCENDING), ("username", ASCENDING)]
         )
         return [_public_user(user) for user in users]
@@ -270,7 +265,7 @@ def _create_auth_session(user: dict[str, Any]) -> str:
         _auth_sessions[token] = {
             "user_id": str(user["_id"]),
             "username": user["username"],
-            "role": user.get("role", "user"),
+            "role": _clean_role(user.get("role")),
             "last_access": time.time(),
         }
     return token
