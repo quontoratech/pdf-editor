@@ -160,7 +160,25 @@ class PdfEngine:
         all_spans,
         selected_span: TextSpan,
         new_width: float,
+        expansion_direction: str = "right",
     ):
+        """
+        Plan a single-line width expansion.
+
+        ``right`` (default):
+            keep the original left edge fixed and grow to the right.
+
+        ``left``:
+            keep the original right edge fixed and grow to the left.
+
+        Tightly connected spans on the chosen expansion side may be shifted by
+        the same amount. If the movement would collide with a separate field or
+        leave the physical page, the plan is rejected.
+        """
+        direction = str(expansion_direction or "right").strip().lower()
+        if direction not in {"right", "left"}:
+            direction = "right"
+
         old_x0, old_y0, old_x1, old_y1 = selected_span.bbox
         old_width = old_x1 - old_x0
 
@@ -170,22 +188,143 @@ class PdfEngine:
         expanded_width = max(old_width, float(new_width))
         extra = max(0.0, expanded_width - old_width)
 
-        expanded_bbox = (
-            old_x0,
-            old_y0,
-            old_x0 + expanded_width,
-            old_y1,
-        )
+        if direction == "left":
+            expanded_bbox = (
+                old_x1 - expanded_width,
+                old_y0,
+                old_x1,
+                old_y1,
+            )
+            replacement_origin = (
+                selected_span.origin[0] - extra,
+                selected_span.origin[1],
+            )
+        else:
+            expanded_bbox = (
+                old_x0,
+                old_y0,
+                old_x0 + expanded_width,
+                old_y1,
+            )
+            replacement_origin = selected_span.origin
 
         if extra <= 0.01:
             return {
                 "ok": True,
                 "expanded_bbox": expanded_bbox,
+                "replacement_origin": replacement_origin,
                 "extra_width": 0.0,
                 "shifts": [],
+                "direction": direction,
                 "reason": "Replacement fits inside the original width.",
             }
 
+        cluster_gap_limit = max(16.0, selected_span.size * 2.25)
+        safe_gap = 1.0
+
+        if direction == "left":
+            left_spans = []
+            for span in all_spans:
+                if self._same_span(span, selected_span):
+                    continue
+                if not self._same_line(span, selected_span):
+                    continue
+                if span.bbox[2] > old_x0 + 0.35:
+                    continue
+                left_spans.append(span)
+
+            # Closest span on the left first.
+            left_spans.sort(
+                key=lambda s: (s.bbox[2], s.bbox[1]),
+                reverse=True,
+            )
+
+            continuation = []
+            next_separate = None
+            previous_old_start = old_x0
+
+            for span in left_spans:
+                gap = previous_old_start - span.bbox[2]
+
+                if gap <= cluster_gap_limit:
+                    continuation.append(span)
+                    previous_old_start = min(
+                        previous_old_start,
+                        span.bbox[0],
+                    )
+                else:
+                    next_separate = span
+                    break
+
+            shifts = [
+                (span, -extra)
+                for span in continuation
+            ]
+
+            if continuation:
+                cluster_new_start = min(
+                    span.bbox[0] - extra
+                    for span in continuation
+                )
+            else:
+                cluster_new_start = expanded_bbox[0]
+
+            if next_separate is not None:
+                if cluster_new_start - safe_gap < next_separate.bbox[2]:
+                    return {
+                        "ok": False,
+                        "fallback": "none",
+                        "expanded_bbox": expanded_bbox,
+                        "replacement_origin": replacement_origin,
+                        "extra_width": extra,
+                        "shifts": [],
+                        "direction": direction,
+                        "reason": (
+                            "Left expansion reaches another text field. "
+                            "Choose Move Right or use a shorter replacement."
+                        ),
+                        "blocking_span": next_separate,
+                    }
+
+            page_left = float(page.rect.x0)
+            left_margin = 3.0
+            if cluster_new_start < page_left + left_margin:
+                return {
+                    "ok": False,
+                    "fallback": "none",
+                    "expanded_bbox": expanded_bbox,
+                    "replacement_origin": replacement_origin,
+                    "extra_width": extra,
+                    "shifts": [],
+                    "direction": direction,
+                    "reason": (
+                        "Left expansion reaches the page edge. "
+                        "Choose Move Right or use a shorter replacement."
+                    ),
+                }
+
+            if continuation:
+                reason = (
+                    f"Expanded left by {extra:.2f} pt and shifted "
+                    f"{len(continuation)} preceding span(s) left by the same amount."
+                )
+            else:
+                reason = (
+                    f"Expanded left by {extra:.2f} pt into available blank space. "
+                    "The original right edge stayed fixed."
+                )
+
+            return {
+                "ok": True,
+                "expanded_bbox": expanded_bbox,
+                "replacement_origin": replacement_origin,
+                "extra_width": extra,
+                "shifts": shifts,
+                "direction": direction,
+                "reason": reason,
+            }
+
+        # Default / Move Right behaviour.
         right_spans = []
         for span in all_spans:
             if self._same_span(span, selected_span):
@@ -198,7 +337,6 @@ class PdfEngine:
 
         right_spans.sort(key=lambda s: (s.bbox[0], s.bbox[1]))
 
-        cluster_gap_limit = max(16.0, selected_span.size * 2.25)
         continuation = []
         next_separate = None
         previous_old_end = old_x1
@@ -216,19 +354,23 @@ class PdfEngine:
         shifts = [(span, extra) for span in continuation]
 
         if continuation:
-            cluster_new_end = max(span.bbox[2] + extra for span in continuation)
+            cluster_new_end = max(
+                span.bbox[2] + extra
+                for span in continuation
+            )
         else:
             cluster_new_end = expanded_bbox[2]
 
-        safe_gap = 1.0
         if next_separate is not None:
             if cluster_new_end + safe_gap > next_separate.bbox[0]:
                 return {
                     "ok": False,
                     "fallback": "multiline",
                     "expanded_bbox": expanded_bbox,
+                    "replacement_origin": replacement_origin,
                     "extra_width": extra,
                     "shifts": [],
+                    "direction": direction,
                     "reason": (
                         "Horizontal expansion reaches another text field. "
                         "Multiline paragraph reflow is required."
@@ -243,8 +385,10 @@ class PdfEngine:
                 "ok": False,
                 "fallback": "multiline",
                 "expanded_bbox": expanded_bbox,
+                "replacement_origin": replacement_origin,
                 "extra_width": extra,
                 "shifts": [],
+                "direction": direction,
                 "reason": (
                     "Horizontal expansion reaches the page edge. "
                     "Multiline paragraph reflow is required."
@@ -253,20 +397,22 @@ class PdfEngine:
 
         if continuation:
             reason = (
-                f"Expanded by {extra:.2f} pt and shifted "
-                f"{len(continuation)} following span(s) by the same amount."
+                f"Expanded right by {extra:.2f} pt and shifted "
+                f"{len(continuation)} following span(s) right by the same amount."
             )
         else:
             reason = (
-                f"Expanded by {extra:.2f} pt into available blank space. "
-                "No following text needed to move."
+                f"Expanded right by {extra:.2f} pt into available blank space. "
+                "The original left edge stayed fixed."
             )
 
         return {
             "ok": True,
             "expanded_bbox": expanded_bbox,
+            "replacement_origin": replacement_origin,
             "extra_width": extra,
             "shifts": shifts,
+            "direction": direction,
             "reason": reason,
         }
 
@@ -870,6 +1016,128 @@ class PdfEngine:
                     return
             raise
 
+
+    @staticmethod
+    def _norm_validation_text(value: str) -> str:
+        value = (value or "").replace("\u00a0", " ")
+        return re.sub(r"\s+", " ", value).strip()
+
+    def _validate_replacement_now(
+        self,
+        page,
+        original_text: str,
+        replacement_text: str,
+        original_bbox,
+        final_bbox,
+        font_size: float,
+    ):
+        """
+        Validate a replacement immediately after it is applied.
+
+        The current in-memory document is serialized and reopened, so this check
+        sees the same searchable text layer that a later Save As validation sees.
+        If this method raises, the caller should restore its pre-edit snapshot.
+        """
+        doc = page.parent
+        if doc is None:
+            raise ValueError(
+                "Replacement cancelled: the edited page is no longer attached to a PDF."
+            )
+
+        page_number = int(page.number)
+
+        try:
+            raw = doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+            )
+        except TypeError:
+            raw = doc.tobytes()
+
+        probe = pymupdf.open(stream=raw, filetype="pdf")
+        try:
+            check_page = probe[page_number]
+
+            ob = tuple(original_bbox)
+            fb = tuple(final_bbox)
+
+            rect = pymupdf.Rect(
+                min(ob[0], fb[0]) - 2.0,
+                min(ob[1], fb[1]) - 3.0,
+                max(ob[2], fb[2]) + 8.0,
+                max(ob[3], fb[3]) + max(6.0, float(font_size) * 1.5),
+            ) & check_page.rect
+
+            region_text = check_page.get_text("text", clip=rect)
+
+            norm_region = self._norm_validation_text(region_text)
+            norm_old = self._norm_validation_text(original_text)
+            norm_new = self._norm_validation_text(replacement_text)
+
+            same_text = bool(norm_old) and norm_old == norm_new
+            old_is_part_of_new = (
+                bool(norm_old)
+                and bool(norm_new)
+                and norm_old in norm_new
+            )
+
+            old_present = (
+                (not same_text)
+                and (not old_is_part_of_new)
+                and bool(norm_old)
+                and norm_old in norm_region
+            )
+
+            replacement_occurrences = (
+                norm_region.count(norm_new)
+                if norm_new
+                else 0
+            )
+
+            new_present = (
+                (not norm_new)
+                or replacement_occurrences >= 1
+            )
+
+            single_replacement = (
+                (not norm_new)
+                or replacement_occurrences == 1
+            )
+
+            old_intersections = []
+            if norm_old and not same_text and not old_is_part_of_new:
+                try:
+                    for hit in check_page.search_for(original_text):
+                        if hit.intersects(rect):
+                            old_intersections.append(tuple(hit))
+                except Exception:
+                    pass
+
+            reasons = []
+
+            if old_present or old_intersections:
+                reasons.append("original text is still searchable")
+
+            if not new_present:
+                reasons.append("replacement text is not searchable after the edit")
+
+            if not single_replacement:
+                reasons.append(
+                    f"replacement appears {replacement_occurrences} times in the edited region"
+                )
+
+            if reasons:
+                raise ValueError(
+                    "Replacement cancelled: " + "; ".join(reasons) + "."
+                )
+
+            return True
+
+        finally:
+            probe.close()
+
     def replace_with_horizontal_reflow(
         self,
         page,
@@ -878,6 +1146,7 @@ class PdfEngine:
         selected_candidate: FontCandidate,
         expanded_bbox,
         shifted_items,
+        replacement_origin=None,
     ):
         page.add_redact_annot(
             pymupdf.Rect(selected_span.bbox),
@@ -898,12 +1167,15 @@ class PdfEngine:
             text=pymupdf.PDF_REDACT_TEXT_REMOVE,
         )
 
+        if replacement_origin is None:
+            replacement_origin = selected_span.origin
+
         self._insert_text(
             page,
             selected_span,
             replacement,
             selected_candidate,
-            origin=selected_span.origin,
+            origin=replacement_origin,
         )
 
         for item in shifted_items:
@@ -922,10 +1194,20 @@ class PdfEngine:
                 origin=new_origin,
             )
 
+        # Transaction guard: reject the edit now instead of waiting for Save As.
+        self._validate_replacement_now(
+            page,
+            original_text=selected_span.text,
+            replacement_text=replacement,
+            original_bbox=selected_span.bbox,
+            final_bbox=expanded_bbox,
+            font_size=selected_span.size,
+        )
+
         return TextSpan(
             text=replacement,
             bbox=tuple(expanded_bbox),
-            origin=selected_span.origin,
+            origin=tuple(replacement_origin),
             font=selected_span.font,
             size=selected_span.size,
             flags=selected_span.flags,
@@ -999,6 +1281,16 @@ class PdfEngine:
                 ),
             )
 
+        # Transaction guard: reject the edit now instead of waiting for Save As.
+        self._validate_replacement_now(
+            page,
+            original_text=selected_span.text,
+            replacement_text=replacement,
+            original_bbox=selected_span.bbox,
+            final_bbox=plan["selected_bbox"],
+            font_size=selected_span.size,
+        )
+
         return TextSpan(
             text=replacement,
             bbox=tuple(plan["selected_bbox"]),
@@ -1038,4 +1330,14 @@ class PdfEngine:
             span,
             replacement,
             candidate,
+        )
+
+        # Transaction guard for direct single-span replacement.
+        self._validate_replacement_now(
+            page,
+            original_text=span.text,
+            replacement_text=replacement,
+            original_bbox=span.bbox,
+            final_bbox=span.bbox,
+            font_size=span.size,
         )

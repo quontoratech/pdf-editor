@@ -1,0 +1,96 @@
+WEB FONT BOT SETUP
+==================
+
+What this version does
+----------------------
+1. Checks the PDF embedded font / existing PDF resources.
+2. Checks manually loaded fonts.
+3. Checks installed system fonts.
+4. Checks Fontsource.
+5. If still not found, searches a broad web index through Brave Search API.
+6. Opens search-result pages without running JavaScript and looks for direct .ttf/.otf links.
+7. Downloads candidate font files only from public HTTP/HTTPS addresses.
+8. Rejects obvious non-font payloads and oversized files.
+9. Verifies exact family, weight/style, required Unicode glyphs, and font licensing/embedding metadata.
+10. Caches a passing font and returns it to the existing PDF resolver.
+
+IMPORTANT
+---------
+This searches a broad web search index; no practical program can literally crawl every page on the Internet per font lookup.
+The bot does NOT run JavaScript on result pages and does NOT bypass paywalls/login/download protections.
+Unknown/restricted-license fonts are rejected by default.
+Automatically downloaded fonts are embedded as normal verified font resources; they are not spliced into an unrelated existing PDF subset.
+
+FILES
+-----
+Copy both files into your project's app/ directory:
+
+    app/font_resolver.py
+    app/online_font_resolver.py
+
+Back up your current app/font_resolver.py first.
+
+ENVIRONMENT
+-----------
+Add these lines to the project-root .env file:
+
+AUTO_FONT_DOWNLOAD=1
+AUTO_FONT_ALLOW_FONTSOURCE_OTHER=0
+
+# Broad web search
+AUTO_FONT_WEB_SEARCH=1
+AUTO_FONT_WEB_DOWNLOAD=1
+BRAVE_SEARCH_API_KEY=PASTE_YOUR_BRAVE_SEARCH_API_KEY_HERE
+
+# Search tuning
+AUTO_FONT_WEB_MAX_RESULTS=30
+AUTO_FONT_SEARCH_COUNTRY=US
+AUTO_FONT_SEARCH_LANG=en
+
+# Keep this OFF. If 0, a random internet font with unknown license is not auto-used.
+AUTO_FONT_ALLOW_UNKNOWN_LICENSE=0
+
+# Optional cache folder
+# FONT_CACHE_DIR=/Users/macbook/Desktop/pdf/font_cache
+
+BRAVE SEARCH KEY
+----------------
+Create a Brave Search API key in the Brave Search API dashboard. Keep the key only in .env.
+Do not put it in JavaScript or commit it to Git.
+
+CHECK INSTALLATION
+------------------
+From pdf_text_browser/ run:
+
+    python -m py_compile app/font_resolver.py app/online_font_resolver.py
+    python -m tabnanny -v app/font_resolver.py app/online_font_resolver.py
+
+Expected tabnanny result:
+
+    Clean bill of health.
+
+Then restart:
+
+    python main.py
+
+TEST THE BOT DIRECTLY
+---------------------
+Run:
+
+    python test_web_font_search.py "Roboto" 400 normal "HELLO WORLD"
+
+For a family that Fontsource does not have, the resolver will continue to Brave web search when BRAVE_SEARCH_API_KEY is configured.
+
+SECURITY / QUALITY CHECKS
+-------------------------
+The broad-web path rejects:
+- localhost/private/link-local network URLs
+- non-TTF/OTF files
+- oversized candidate files
+- family-name mismatch
+- weight/style mismatch
+- missing replacement glyphs
+- OS/2 restricted-license embedding fonts
+- unknown licenses, unless AUTO_FONT_ALLOW_UNKNOWN_LICENSE=1 is explicitly enabled
+
+If a website hides its font behind JavaScript, a login, a zip-only download button, or a proprietary licensing workflow, the bot will report that it found the page but could not safely obtain a direct verified TTF/OTF file.

@@ -25,6 +25,7 @@ from .font_utils import (
 )
 from .models import FontCandidate, FontResolution, TextSpan, DocxFontReference
 from .cff_subset_extender import inspect_existing_cff
+from .online_font_resolver import OnlineFontResolver
 
 
 def humanize_pdf_font_name(name: str) -> str:
@@ -276,6 +277,8 @@ class FontResolver:
         self.manual_fonts = {}
         self.manual_candidates = []
         self._fingerprint_cache = {}
+        self.online_fonts = OnlineFontResolver()
+        self.last_online_note = ""
 
     def add_manual_font(self, path: str):
         meta = read_font_metadata_from_path(path)
@@ -870,6 +873,13 @@ class FontResolver:
         if not full_candidate:
             return full_candidate
 
+        # Automatically downloaded open fonts are used as normal verified font
+        # resources. Never splice their glyphs into an existing PDF subset.
+        # This keeps online lookup useful for ordinary/synthetic PDFs without
+        # pretending a same-named public font is the original embedded program.
+        if getattr(full_candidate, "_online_download", False):
+            return full_candidate
+
         record = self.find_page_font(page, span)
         if not record:
             return full_candidate
@@ -901,6 +911,143 @@ class FontResolver:
             subset_extension_font_path=getattr(full_candidate, "path", None),
             subset_extension_font_bytes=getattr(full_candidate, "embedded_bytes", None),
         )
+
+    @staticmethod
+    def _fonttools_path_has_text(path: str, text: str):
+        """
+        Verify replacement glyph coverage directly from the font's Unicode cmap.
+
+        This is used when a manually loaded full TTF/OTF will be used to extend
+        the original PDF Type1C/CFF subset. In that path, fontTools is the
+        authoritative source because the CFF subset extender consumes the full
+        font through TTFont rather than through PyMuPDF's has_glyph() check.
+        """
+        if text == "":
+            return True, []
+
+        font = None
+        try:
+            font = TTFont(path, lazy=True)
+
+            codepoints = set()
+
+            # Prefer every Unicode cmap subtable instead of relying only on
+            # getBestCmap(). Some valid fonts expose useful mappings in a Unicode
+            # subtable that getBestCmap() does not choose.
+            if "cmap" in font:
+                for table in font["cmap"].tables:
+                    try:
+                        if table.isUnicode():
+                            codepoints.update((table.cmap or {}).keys())
+                    except Exception:
+                        continue
+
+            # Fall back to getBestCmap() when needed.
+            if not codepoints:
+                best = font.getBestCmap() or {}
+                codepoints.update(best.keys())
+
+            missing = []
+            seen = set()
+
+            for char in text:
+                if char.isspace() or char in "\r\n\t":
+                    continue
+
+                cp = ord(char)
+                if cp in seen:
+                    continue
+                seen.add(cp)
+
+                if cp not in codepoints:
+                    missing.append(char)
+
+            return not missing, missing
+
+        except Exception:
+            # Do not falsely approve an unreadable font.
+            missing = []
+            seen = set()
+            for char in text:
+                if char.isspace() or char in "\r\n\t" or char in seen:
+                    continue
+                seen.add(char)
+                missing.append(char)
+            return False, missing
+
+        finally:
+            if font is not None:
+                try:
+                    font.close()
+                except Exception:
+                    pass
+
+    def _candidate_text_check(self, page, span: TextSpan, candidate, replacement_text: str):
+        """
+        Prepare a candidate for its real write path and verify glyph coverage
+        using the same font technology that path will use.
+
+        Returns:
+            (resolved_candidate, glyphs_ok, missing_chars)
+        """
+        resolved = self._cff_subset_extension_candidate(page, span, candidate)
+
+        if getattr(resolved, "extend_original_cff", False) and getattr(candidate, "path", None):
+            glyphs_ok, missing = self._fonttools_path_has_text(
+                candidate.path,
+                replacement_text,
+            )
+        elif getattr(candidate, "path", None):
+            glyphs_ok, missing = font_path_has_text(
+                candidate.path,
+                replacement_text,
+            )
+        else:
+            glyphs_ok = False
+            missing = [
+                ch for ch in dict.fromkeys(replacement_text)
+                if not ch.isspace() and ch not in "\r\n\t"
+            ]
+
+        return resolved, glyphs_ok, missing
+
+    def _online_match(self, family, weight, italic, replacement_text):
+        """
+        Search approved catalogs and the broad web index, download/cache an exact family
+        face, then convert it into the same FontCandidate used by the rest of the
+        editor. Provider failure is non-fatal; the resolver simply continues.
+        """
+        result, note = self.online_fonts.find_exact(
+            family=family,
+            weight=weight,
+            italic=italic,
+            required_text=replacement_text,
+        )
+        self.last_online_note = note or ""
+
+        if not result:
+            return None, self.last_online_note
+
+        candidate = _font_candidate_from_path(
+            result.path,
+            source=f"Auto-downloaded verified font ({result.provider})",
+        )
+        if not candidate:
+            return None, (
+                self.last_online_note
+                + " Downloaded font metadata could not be converted to a candidate."
+            ).strip()
+
+        # Non-dataclass helper attributes are intentional and already used by
+        # this resolver for PDF-specific candidate decisions.
+        candidate._online_download = True
+        candidate._online_provider = result.provider
+        candidate._online_font_id = result.font_id
+        candidate._online_subset = result.subset
+        candidate._online_source_url = result.source_url
+        candidate._online_sha256 = result.sha256
+
+        return candidate, self.last_online_note
 
     def _manual_match(self, family, weight, italic):
         family_norm = normalize_font_name(family)
@@ -1405,13 +1552,14 @@ class FontResolver:
             )
 
             if manual and manual.path:
-                glyphs_ok, missing = font_path_has_text(
-                    manual.path,
+                resolved_manual, glyphs_ok, missing = self._candidate_text_check(
+                    page,
+                    span,
+                    manual,
                     replacement_text,
                 )
 
                 if glyphs_ok:
-                    resolved_manual = self._cff_subset_extension_candidate(page, span, manual)
                     return FontResolution(
                         ok=True,
                         candidate=resolved_manual,
@@ -1421,7 +1569,13 @@ class FontResolver:
                         glyphs_ok=True,
                         source_note=(
                             "DOCX Reference Mode: matched the DOCX family to a "
-                            "manually loaded exact font file."
+                            "manually loaded exact font file. "
+                            + (
+                                "Glyph coverage was verified from the full font cmap "
+                                "for Type1C/CFF subset extension."
+                                if getattr(resolved_manual, "extend_original_cff", False)
+                                else ""
+                            )
                         ),
                     )
 
@@ -1455,13 +1609,47 @@ class FontResolver:
                         ),
                     )
 
-            # DOCX identified the family, but it is not installed or lacks glyphs.
+            online, online_note = self._online_match(
+                docx_ref.family,
+                target_weight,
+                target_italic,
+                replacement_text,
+            )
+
+            if online and online.path:
+                glyphs_ok, missing = font_path_has_text(
+                    online.path,
+                    replacement_text,
+                )
+                weight_ok = abs((online.weight or 400) - target_weight) <= 100
+                italic_ok = online.italic == target_italic
+
+                if glyphs_ok and weight_ok and italic_ok:
+                    return FontResolution(
+                        ok=True,
+                        candidate=online,
+                        exact_family=True,
+                        exact_weight=True,
+                        exact_style=True,
+                        glyphs_ok=True,
+                        source_note=(
+                            "DOCX Reference Mode: exact open font family was not "
+                            "available locally, so it was automatically downloaded, "
+                            "verified and cached. "
+                            + (online_note or "")
+                        ),
+                    )
+
+            # DOCX identified the family, but local and approved online exact-face
+            # lookup both failed.
             return FontResolution(
                 ok=False,
                 reason=(
                     f"DOCX Reference Mode identified '{docx_ref.family}', but the "
-                    "matching full font face could not be verified on this computer. "
-                    "Install it or use 'Load Exact TTF/OTF Font...'."
+                    "matching full font face could not be verified locally or from "
+                    "the approved open-font provider. "
+                    + (online_note or "")
+                    + " Install it or use 'Load Exact TTF/OTF Font...'."
                 ),
             )
 
@@ -1576,6 +1764,7 @@ class FontResolver:
         # lookup only; it still never chooses Arial / Sukhumvit / etc. just because
         # their metrics happen to look similar.
         readable_pdf_family = humanize_pdf_font_name(pdf_name)
+        online_note = ""
 
         if readable_pdf_family:
             manual = self._manual_match(
@@ -1585,13 +1774,14 @@ class FontResolver:
             )
 
             if manual and manual.path:
-                glyphs_ok, missing = font_path_has_text(
-                    manual.path,
+                resolved_manual, glyphs_ok, missing = self._candidate_text_check(
+                    page,
+                    span,
+                    manual,
                     replacement_text,
                 )
 
                 if glyphs_ok:
-                    resolved_manual = self._cff_subset_extension_candidate(page, span, manual)
                     return FontResolution(
                         ok=True,
                         candidate=resolved_manual,
@@ -1606,10 +1796,11 @@ class FontResolver:
                             f"'{readable_pdf_family}' matched a manually loaded "
                             "full font file. "
                             + (
-                                "V3.12 will extend the original Type1C/CFF subset in-place "
-                                "and keep the original PDF /F# resource."
+                                "The full font Unicode cmap verified the replacement "
+                                "glyphs. V3.12 will extend the original Type1C/CFF "
+                                "subset in-place and keep the original PDF /F# resource."
                                 if getattr(resolved_manual, "extend_original_cff", False)
-                                else ""
+                                else "The replacement glyphs passed the normal font check."
                             )
                         ),
                     )
@@ -1647,6 +1838,39 @@ class FontResolver:
                                 if getattr(resolved_system, "extend_original_cff", False)
                                 else ""
                             )
+                        ),
+                    )
+
+            online, online_note = self._online_match(
+                readable_pdf_family,
+                target_weight,
+                target_italic,
+                replacement_text,
+            )
+
+            if online and online.path:
+                glyphs_ok, missing = font_path_has_text(
+                    online.path,
+                    replacement_text,
+                )
+                weight_ok = abs((online.weight or 400) - target_weight) <= 100
+                italic_ok = online.italic == target_italic
+
+                if glyphs_ok and weight_ok and italic_ok:
+                    return FontResolution(
+                        ok=True,
+                        candidate=online,
+                        exact_family=True,
+                        exact_weight=True,
+                        exact_style=True,
+                        glyphs_ok=True,
+                        source_note=(
+                            "PDF-Only Exact Font Mode: the readable PDF family name "
+                            f"'{readable_pdf_family}' matched an approved open font "
+                            "that was automatically downloaded, verified and cached. "
+                            "It will be embedded as a normal font resource; online "
+                            "glyphs are not spliced into the original PDF subset. "
+                            + (online_note or "")
                         ),
                     )
 
@@ -1723,6 +1947,8 @@ class FontResolver:
 
         if resource_note:
             reason += " " + resource_note
+        if online_note:
+            reason += " " + online_note
         if fingerprint_note:
             reason += " " + fingerprint_note
 

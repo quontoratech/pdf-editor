@@ -412,21 +412,82 @@ class CleanEditSession:
         return removed
 
     def _validate_clean_text(self, path: str) -> dict:
+        """
+        Validate the final saved PDF without treating superseded intermediate
+        replacements as if they must still be present.
+
+        Example:
+            Original A -> replacement B -> replacement C
+
+        Edit A->B remains in the audit history, but B is an intermediate state.
+        Only the latest active replacement C must still exist in the final PDF.
+        """
         doc = pymupdf.open(path)
         failures: list[str] = []
         checks: list[dict] = []
+        edits = list(self.edits)
+
+        def _rect(values):
+            return pymupdf.Rect(
+                float(values[0]),
+                float(values[1]),
+                float(values[2]),
+                float(values[3]),
+            )
+
+        def _same_edit_location(old_edit: dict, later_edit: dict) -> bool:
+            if int(old_edit["page"]) != int(later_edit["page"]):
+                return False
+
+            old_new = _norm_text(old_edit.get("replacement_text", ""))
+            later_old = _norm_text(later_edit.get("original_text", ""))
+
+            # Strongest signal: the later edit selected the previous
+            # replacement text from the same edited field.
+            if old_new and later_old and old_new == later_old:
+                return True
+
+            try:
+                old_final = _rect(old_edit["final_bbox"])
+                later_original = _rect(later_edit["original_bbox"])
+                intersection = old_final & later_original
+
+                if intersection.is_empty:
+                    return False
+
+                old_area = max(0.01, old_final.get_area())
+                later_area = max(0.01, later_original.get_area())
+                overlap_area = max(0.0, intersection.get_area())
+                overlap_ratio = overlap_area / min(old_area, later_area)
+
+                # Conservative fallback for edits to the same physical field.
+                return overlap_ratio >= 0.85
+            except Exception:
+                return False
+
+        superseded_indexes: set[int] = set()
+
+        for old_index, old_edit in enumerate(edits):
+            for later_index in range(old_index + 1, len(edits)):
+                if _same_edit_location(old_edit, edits[later_index]):
+                    superseded_indexes.add(old_index)
+                    break
+
         try:
-            for idx, edit in enumerate(self.edits, start=1):
+            for zero_index, edit in enumerate(edits):
+                idx = zero_index + 1
                 pno = int(edit["page"])
                 page = doc[pno - 1]
 
                 ob = edit["original_bbox"]
                 fb = edit["final_bbox"]
+
                 rect = pymupdf.Rect(
                     min(ob[0], fb[0]) - 2.0,
                     min(ob[1], fb[1]) - 3.0,
                     max(ob[2], fb[2]) + 8.0,
-                    max(ob[3], fb[3]) + max(6.0, float(edit["font_size_pt"]) * 1.5),
+                    max(ob[3], fb[3])
+                    + max(6.0, float(edit["font_size_pt"]) * 1.5),
                 ) & page.rect
 
                 region_text = page.get_text("text", clip=rect)
@@ -436,9 +497,6 @@ class CleanEditSession:
 
                 same_text = bool(norm_old) and norm_old == norm_new
 
-                # Important:
-                # If the old text is naturally contained inside the replacement,
-                # do not treat that substring as leftover old text.
                 old_is_part_of_new = (
                     bool(norm_old)
                     and bool(norm_new)
@@ -452,24 +510,6 @@ class CleanEditSession:
                     and norm_old in norm_region
                 )
 
-                replacement_occurrences = (
-                    norm_region.count(norm_new)
-                    if norm_new
-                    else 0
-                )
-
-                new_present = (
-                    (not norm_new)
-                    or replacement_occurrences >= 1
-                )
-
-                single_replacement = (
-                    (not norm_new)
-                    or replacement_occurrences == 1
-                )
-
-                # Also use positional search when possible. This catches old text
-                # that was retained as hidden / overlapping searchable content.
                 old_intersections = []
 
                 if norm_old and not same_text and not old_is_part_of_new:
@@ -480,31 +520,124 @@ class CleanEditSession:
                     except Exception:
                         pass
 
-                passed = (not old_present) and (not old_intersections) and new_present and single_replacement
+                replacement_occurrences = (
+                    norm_region.count(norm_new)
+                    if norm_new
+                    else 0
+                )
+
+                superseded = zero_index in superseded_indexes
+
+                if superseded:
+                    # This replacement was intentionally replaced again later.
+                    # It does not need to remain in the final PDF.
+                    passed = (
+                        not old_present
+                        and not old_intersections
+                    )
+
+                    checks.append(
+                        {
+                            "edit": idx,
+                            "page": pno,
+                            "superseded": True,
+                            "old_text_absent_in_region": not old_present,
+                            "old_search_hits_in_region": len(old_intersections),
+                            "replacement_present_in_region": None,
+                            "replacement_occurrences_in_region":
+                                replacement_occurrences,
+                            "single_replacement_in_region": None,
+                            "passed": passed,
+                        }
+                    )
+
+                    if not passed:
+                        reasons = []
+
+                        if old_present:
+                            reasons.append("original text is still present")
+
+                        if old_intersections:
+                            reasons.append("original text is still searchable")
+
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | "
+                            f"x={fb[0]:.2f}, y={fb[1]:.2f}, "
+                            f"w={fb[2]-fb[0]:.2f}, h={fb[3]-fb[1]:.2f} | "
+                            f"Original: {edit['original_text']!r} | "
+                            "This edit was later replaced again | "
+                            f"Issue: {'; '.join(reasons)}."
+                        )
+
+                    continue
+
+                # Latest / active edit: its replacement must exist.
+                new_present = (
+                    (not norm_new)
+                    or replacement_occurrences >= 1
+                )
+
+                single_replacement = (
+                    (not norm_new)
+                    or replacement_occurrences == 1
+                )
+
+                passed = (
+                    (not old_present)
+                    and (not old_intersections)
+                    and new_present
+                    and single_replacement
+                )
+
                 checks.append(
                     {
                         "edit": idx,
                         "page": pno,
+                        "superseded": False,
                         "old_text_absent_in_region": not old_present,
                         "old_search_hits_in_region": len(old_intersections),
                         "replacement_present_in_region": new_present,
-                        "replacement_occurrences_in_region": replacement_occurrences,
+                        "replacement_occurrences_in_region":
+                            replacement_occurrences,
                         "single_replacement_in_region": single_replacement,
                         "passed": passed,
                     }
                 )
 
-
                 if not passed:
+                    reasons = []
+
+                    if old_present:
+                        reasons.append("original text is still present")
+
+                    if old_intersections:
+                        reasons.append("original text is still searchable")
+
+                    if not new_present:
+                        reasons.append("replacement text is missing")
+
+                    if norm_new and replacement_occurrences != 1:
+                        reasons.append(
+                            f"replacement appears {replacement_occurrences} times"
+                        )
 
                     failures.append(
-                        f"Edit {idx} on page {pno} failed clean-text validation."
+                        f"Edit {idx} | Page {pno} | "
+                        f"x={fb[0]:.2f}, y={fb[1]:.2f}, "
+                        f"w={fb[2]-fb[0]:.2f}, h={fb[3]-fb[1]:.2f} | "
+                        f"Original: {edit['original_text']!r} | "
+                        f"Final replacement: {edit['replacement_text']!r} | "
+                        f"Issue: {'; '.join(reasons)}."
                     )
 
         finally:
             doc.close()
 
-        return {"ok": not failures, "checks": checks, "failures": failures}
+        return {
+            "ok": not failures,
+            "checks": checks,
+            "failures": failures,
+        }
 
     def export_clean(self, doc, output_path: str) -> tuple[str, str, str]:
         output_path = os.path.abspath(output_path)

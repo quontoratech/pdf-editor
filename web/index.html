@@ -5,6 +5,70 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>PDF Text Style Editor</title>
   <link rel="stylesheet" href="/static/style.css" />
+
+  <style>
+    .direction-picker {
+      margin: 12px 0 14px;
+      padding: 12px 14px;
+      border: 1px solid #d9dee8;
+      border-radius: 10px;
+      background: #f8fafc;
+    }
+
+    .direction-picker > span {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #344054;
+    }
+
+    .direction-options {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .direction-option {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 10px;
+      border: 1px solid #d0d5dd;
+      border-radius: 8px;
+      background: #fff;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .direction-option:has(input:checked) {
+      border-color: #2f6fdd;
+      box-shadow: 0 0 0 1px #2f6fdd inset;
+      background: #f3f7ff;
+    }
+
+    .direction-option input {
+      margin: 0;
+    }
+
+    .direction-option input:disabled + span {
+      opacity: .55;
+    }
+
+    .direction-help {
+      display: block;
+      margin-top: 8px;
+      font-size: 12px;
+      line-height: 1.35;
+      color: #667085;
+    }
+
+    @media (max-width: 560px) {
+      .direction-options {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
 </head>
 <body>
   <section id="loginView" class="login-view">
@@ -131,9 +195,42 @@
           <h3>Replacement</h3>
           <label for="newText">New text</label>
           <textarea id="newText" placeholder="Enter replacement text..." disabled></textarea>
+
+          <div class="direction-picker">
+            <span>Expansion direction</span>
+            <div class="direction-options">
+              <label class="direction-option">
+                <input
+                  id="moveRight"
+                  type="radio"
+                  name="expansionDirection"
+                  value="right"
+                  checked
+                  disabled
+                />
+                <span>Move Right (default)</span>
+              </label>
+
+              <label class="direction-option">
+                <input
+                  id="moveLeft"
+                  type="radio"
+                  name="expansionDirection"
+                  value="left"
+                  disabled
+                />
+                <span>Move Left</span>
+              </label>
+            </div>
+            <small class="direction-help">
+              Move Right keeps the original left edge fixed. Move Left keeps the original right edge fixed.
+            </small>
+          </div>
+
           <div class="stack-actions">
             <button id="loadFontBtn" class="btn" disabled>Load Exact TTF/OTF Font...</button>
-            <button id="findFontBtn" class="btn" disabled>Find Exact Font Online...</button>
+            <button id="dbFontBtn" class="btn" disabled>Search Font from DB...</button>
+            <button id="findFontBtn" class="btn" disabled>Search Exact Font with AI...</button>
             <button id="checkBtn" class="btn" disabled>Re-check Font Match</button>
           </div>
           <div id="matchStatus" class="notice neutral prewrap">Select text to begin.</div>
@@ -176,6 +273,23 @@
         <div id="userListStatus" class="status">Loading users...</div>
         <div id="userListRows" class="user-list-rows"></div>
       </div>
+    </div>
+  </div>
+
+  <div id="fontDbModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="fontDbModalTitle">
+      <div class="modal-heading">
+        <h2 id="fontDbModalTitle">Saved Font Library</h2>
+        <button id="closeFontDbModalBtn" class="btn compact" type="button">Close</button>
+      </div>
+
+      <div class="user-form">
+        <label for="fontDbSearch">Search saved fonts</label>
+        <input id="fontDbSearch" type="text" autocomplete="off" placeholder="Family, face or filename..." />
+      </div>
+
+      <div id="fontDbStatus" class="status">Select a saved font. It will only be accepted if the exact verification passes.</div>
+      <div id="fontDbRows" class="user-list-rows"></div>
     </div>
   </div>
 

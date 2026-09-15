@@ -1,0 +1,61 @@
+AUTO FONT SEARCH / DOWNLOAD / CACHE SETUP
+=========================================
+
+Add these two files to your project:
+
+1) app/font_resolver.py
+   Replace your existing file with: font_resolver_auto_download.py
+
+2) app/online_font_resolver.py
+   Add the new online_font_resolver.py file.
+
+No new pip package is required. The code uses Python urllib plus fontTools,
+which is already in your requirements.txt.
+
+OPTIONAL .env SETTINGS
+----------------------
+AUTO_FONT_DOWNLOAD=1
+# Optional custom cache location:
+# FONT_CACHE_DIR=/absolute/path/to/font_cache
+
+# Default is 0. Keep this disabled unless you intentionally want Fontsource
+# catalog entries outside its Google-font collection:
+AUTO_FONT_ALLOW_FONTSOURCE_OTHER=0
+
+HOW IT WORKS
+------------
+When FontResolver cannot use:
+  1. the PDF's existing exact font resource,
+  2. a manually loaded exact font, or
+  3. an installed exact family,
+
+it automatically:
+  4. searches Fontsource for an exact family,
+  5. requires the exact requested static weight + style,
+  6. downloads a TTF variant over HTTPS from the approved jsDelivr host,
+  7. checks family / weight / italic style,
+  8. checks every required replacement character in the Unicode cmap,
+  9. caches the verified TTF under ~/.cache/pdf_text_browser/fonts,
+ 10. reuses that cached font on later requests.
+
+Auto-downloaded fonts are embedded as normal verified font resources. They are
+NOT spliced into an existing PDF font subset.
+
+TEST
+----
+python -m py_compile app/font_resolver.py app/online_font_resolver.py
+python -m tabnanny -v app/font_resolver.py app/online_font_resolver.py
+python main.py
+
+Quick provider test after activating the venv:
+
+python - <<'PY'
+from app.online_font_resolver import OnlineFontResolver
+r = OnlineFontResolver()
+result, note = r.find_exact("Roboto", 400, False, "Hello World")
+print(note)
+print(result)
+PY
+
+If the server has outbound HTTPS access, this should search, download, verify,
+and cache Roboto Regular from Fontsource.
