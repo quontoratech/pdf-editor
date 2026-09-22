@@ -365,6 +365,158 @@ def main():
         finally:
             line_check.close()
 
+        # Replacing the same field several times must validate only its latest
+        # requested state.  Returning to an earlier intermediate value is
+        # legitimate and must not make that historical edit fail Save As.
+        source = root / "repeated-replacement-source.pdf"
+        output = root / "repeated-replacement-output.pdf"
+        repeated = pymupdf.open()
+        page = repeated.new_page(width=400, height=220)
+        page.insert_text((45, 90), "Original Person", fontname="tiro", fontsize=9)
+        repeated.save(source, deflate=True)
+        repeated.close()
+
+        session = CleanEditSession(str(source))
+        doc = pymupdf.open(source)
+        engine = PdfEngine()
+        candidate = FontCandidate(
+            path=None,
+            family="Times-Roman",
+            full_name="Times-Roman",
+            weight=400,
+            source="Base14",
+            base14_name="tiro",
+        )
+        replacement_chain = [
+            ("Original Person", "Herman Adale Cadoree"),
+            ("Herman Adale Cadoree", "Herman Adale Cadoreee"),
+            ("Herman Adale Cadoreee", "Herman Adale Cadoreeee"),
+            ("Herman Adale Cadoreeee", "Herman Adale Cadoreeeee"),
+            ("Herman Adale Cadoreeeee", "Herman Adale Cadoreee"),
+            ("Herman Adale Cadoreee", "Herman Adale Cadoree"),
+            ("Herman Adale Cadoree", "Herman Adale Cadoreeeeee"),
+        ]
+        selected_span = next(
+            item for item in engine.extract_spans(doc[0])
+            if item.text == replacement_chain[0][0]
+        )
+        for old_text, new_text in replacement_chain:
+            page = doc[0]
+            span = selected_span
+            assert span.text == old_text
+            new_width = engine.replacement_width(
+                candidate,
+                new_text,
+                span.size,
+            )
+            plan = engine.plan_horizontal_expansion(
+                page,
+                engine.extract_spans(page),
+                span,
+                new_width,
+                expansion_direction="right",
+            )
+            assert plan["ok"] is True
+            final_span = engine.replace_with_horizontal_reflow(
+                page,
+                span,
+                new_text,
+                candidate,
+                plan["expanded_bbox"],
+                [],
+                replacement_origin=plan["replacement_origin"],
+            )
+            session.record_edit(
+                page_number=1,
+                original_text=old_text,
+                replacement_text=new_text,
+                original_bbox=span.bbox,
+                final_bbox=final_span.bbox,
+                origin=span.origin,
+                font_family=candidate.family,
+                font_face=candidate.display_name,
+                font_source=candidate.source,
+                font_size=span.size,
+                color=span.color,
+                mode="repeated-replacement-regression",
+            )
+            selected_span = final_span
+
+        _, _, validation_path = session.export_clean(doc, str(output))
+        doc.close()
+        validation = json.loads(Path(validation_path).read_text(encoding="utf-8"))
+        text_checks = validation["checks"]
+        assert validation["text_ok"] is True
+        assert text_checks[0]["superseded"] is True
+        assert text_checks[1]["superseded"] is True
+        assert text_checks[1]["passed"] is True
+        assert all(item["superseded"] for item in text_checks[:-1])
+        assert text_checks[-1]["superseded"] is False
+        repeated_check = pymupdf.open(output)
+        try:
+            final_text = repeated_check[0].get_text("text")
+            assert "Original Person" not in final_text
+            assert final_text.count("Herman Adale Cadoreeeeee") == 1
+        finally:
+            repeated_check.close()
+
+        # Equal text on another part of the same page is not a supersession.
+        # Geometry must also identify the same physical field.
+        source = root / "same-text-different-field-source.pdf"
+        output = root / "same-text-different-field-output.pdf"
+        separate = pymupdf.open()
+        page = separate.new_page(width=400, height=220)
+        page.insert_text((45, 70), "First Source", fontname="tiro", fontsize=9)
+        page.insert_text((45, 140), "Shared Value", fontname="tiro", fontsize=9)
+        separate.save(source, deflate=True)
+        separate.close()
+
+        session = CleanEditSession(str(source))
+        doc = pymupdf.open(source)
+        operations = [
+            ("First Source", "Shared Value"),
+            ("Shared Value", "Final Value"),
+        ]
+        for old_text, new_text in operations:
+            spans = engine.extract_spans(doc[0])
+            if old_text == "Shared Value":
+                span = max(
+                    (item for item in spans if item.text == old_text),
+                    key=lambda item: item.bbox[1],
+                )
+            else:
+                span = next(item for item in spans if item.text == old_text)
+            engine.replace_text(doc[0], span, new_text, candidate)
+            final_span = min(
+                (
+                    item for item in engine.extract_spans(doc[0])
+                    if item.text == new_text
+                ),
+                key=lambda item: abs(item.bbox[1] - span.bbox[1]),
+            )
+            session.record_edit(
+                page_number=1,
+                original_text=old_text,
+                replacement_text=new_text,
+                original_bbox=span.bbox,
+                final_bbox=final_span.bbox,
+                origin=span.origin,
+                font_family=candidate.family,
+                font_face=candidate.display_name,
+                font_source=candidate.source,
+                font_size=span.size,
+                color=span.color,
+                mode="separate-field-regression",
+            )
+
+        _, _, validation_path = session.export_clean(doc, str(output))
+        doc.close()
+        validation = json.loads(Path(validation_path).read_text(encoding="utf-8"))
+        text_checks = validation["checks"]
+        assert validation["text_ok"] is True
+        assert text_checks[0]["superseded"] is False
+        assert text_checks[1]["superseded"] is False
+
         # Missing structural metadata must stay missing: export must not create
         # an Info dictionary, XMP packet, or trailer ID as a side effect.
         source = root / "minimal-source.pdf"

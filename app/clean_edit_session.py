@@ -1237,11 +1237,6 @@ class CleanEditSession:
             old_new = _norm_text(old_edit.get("replacement_text", ""))
             later_old = _norm_text(later_edit.get("original_text", ""))
 
-            # Strongest signal: the later edit selected the previous
-            # replacement text from the same edited field.
-            if old_new and later_old and old_new == later_old:
-                return True
-
             try:
                 old_final = _rect(old_edit["final_bbox"])
                 later_original = _rect(later_edit["original_bbox"])
@@ -1255,7 +1250,15 @@ class CleanEditSession:
                 overlap_area = max(0.0, intersection.get_area())
                 overlap_ratio = overlap_area / min(old_area, later_area)
 
-                # Conservative fallback for edits to the same physical field.
+                # Text equality alone is not sufficient: the same value can
+                # legitimately appear in several fields on one page.  Require
+                # the later selection to occupy the previous replacement's
+                # physical field as well.
+                if old_new and later_old and old_new == later_old:
+                    return overlap_ratio >= 0.50
+
+                # Conservative fallback for edits to the same physical field
+                # when extraction changed the selected text slightly.
                 return overlap_ratio >= 0.85
             except Exception:
                 return False
@@ -1554,7 +1557,7 @@ class CleanEditSession:
 
             return False, "not-found-on-final-page", None
 
-        superseded_indexes: set[int] = set()
+        superseded_by: dict[int, int] = {}
 
         for old_index, old_edit in enumerate(edits):
             if old_edit.get("operation_type", "text") != "text" or old_edit.get("inactive"):
@@ -1564,7 +1567,7 @@ class CleanEditSession:
                 if later_edit.get("operation_type", "text") != "text" or later_edit.get("inactive"):
                     continue
                 if _same_edit_location(old_edit, later_edit):
-                    superseded_indexes.add(old_index)
+                    superseded_by[old_index] = later_index
                     break
 
         try:
@@ -1838,15 +1841,18 @@ class CleanEditSession:
                     else 0
                 )
 
-                superseded = zero_index in superseded_indexes
+                superseded = zero_index in superseded_by
 
                 if superseded:
-                    # This replacement was intentionally replaced again later.
-                    # It does not need to remain in the final PDF.
-                    passed = (
-                        not old_present
-                        and not old_intersections
-                    )
+                    # This is an audit-history record, not the final requested
+                    # state for the field.  Its replacement and original may
+                    # both legitimately reappear in a later edit (for example
+                    # A -> B -> C -> B).  The edit engine validated this step
+                    # immediately when it was applied, while the latest edit at
+                    # this location is validated strictly below against the
+                    # reopened exported PDF.  Re-validating an intermediate
+                    # state here creates a false save failure for such cycles.
+                    passed = True
 
                     checks.append(
                         {
@@ -1854,32 +1860,16 @@ class CleanEditSession:
                             "page": pno,
                             "operation_type": "text",
                             "superseded": True,
-                            "old_text_absent_in_region": not old_present,
-                            "old_search_hits_in_region": len(old_intersections),
+                            "superseded_by_edit": superseded_by[zero_index] + 1,
+                            "validation_scope": "audit-history-only",
+                            "old_text_absent_in_region": None,
+                            "old_search_hits_in_region": None,
                             "replacement_present_in_region": None,
-                            "replacement_occurrences_in_region": replacement_occurrences,
+                            "replacement_occurrences_in_region": None,
                             "single_replacement_in_region": None,
                             "passed": passed,
                         }
                     )
-
-                    if not passed:
-                        reasons = []
-
-                        if old_present:
-                            reasons.append("original text is still present")
-
-                        if old_intersections:
-                            reasons.append("original text is still searchable")
-
-                        failures.append(
-                            f"Edit {idx} | Page {pno} | "
-                            f"x={fb[0]:.2f}, y={fb[1]:.2f}, "
-                            f"w={fb[2]-fb[0]:.2f}, h={fb[3]-fb[1]:.2f} | "
-                            f"Original: {edit['original_text']!r} | "
-                            "This edit was later replaced again | "
-                            f"Issue: {'; '.join(reasons)}."
-                        )
 
                     continue
 
