@@ -171,7 +171,9 @@ def main():
         assert "2020-01-02T03:04:05Z" in xmp_text
         assert "Original Producer Engine" in xmp_text
         assert "Original Creator App" in xmp_text
-        assert "uuid:source-doc-id" not in xmp_text
+        # Exact-metadata policy: unknown/private XMP fields and IDs are not
+        # rebuilt or dropped during export.
+        assert "uuid:source-doc-id" in xmp_text
 
         assert Path(audit).exists()
         assert Path(report).exists()
@@ -181,6 +183,7 @@ def main():
         assert audit_data["export_cleanup"]["empty_annots_entries_removed"] >= 1
 
         assert audit_data["metadata_policy"]["source_metadata_passthrough"] is True
+        assert audit_data["structure_preservation"]["validation_passed"] is True
 
         # A second ordinary PDF also passes through dynamically; no marker is required.
         neutral_src = td / "unmarked.pdf"

@@ -447,6 +447,13 @@ function applyState(
   const hasSelection =
     !!state.selection;
 
+  const lineSelected =
+    !!state.line_selected ||
+    !!state.selection?.line_selected;
+
+  const canReplaceSelection =
+    hasSelection && !lineSelected;
+
   $("emptyState").classList.toggle(
     "hidden",
     hasPdf
@@ -472,28 +479,40 @@ function applyState(
     state.page_index >=
       state.page_count - 1;
 
-  $("loadFontBtn").disabled =
+  $("addPageBtn").disabled =
+    !hasPdf;
+
+  $("deletePageBtn").disabled =
+    !hasPdf || state.page_count <= 1;
+
+  $("selectLineBtn").disabled =
     !hasSelection;
+
+  $("deleteLineBtn").disabled =
+    !lineSelected;
+
+  $("loadFontBtn").disabled =
+    !canReplaceSelection;
 
   $("dbFontBtn").disabled =
-    !hasSelection;
+    !canReplaceSelection;
 
   $("findFontBtn").disabled =
-    !hasSelection;
+    !canReplaceSelection;
 
   $("checkBtn").disabled =
-    !hasSelection;
+    !canReplaceSelection;
 
   $("replaceBtn").disabled =
-    !hasSelection;
+    !canReplaceSelection;
 
   $("newText").disabled =
-    !hasSelection;
+    !canReplaceSelection;
 
-  setExpansionDirectionEnabled(hasSelection);
+  setExpansionDirectionEnabled(canReplaceSelection);
 
-  if (hasSelection && options.resetReplacement !== false) {
-    // Every new selection / completed replacement returns to the safe default.
+  if (canReplaceSelection && options.resetReplacement !== false) {
+    // Every new text selection / completed replacement returns to the safe default.
     setExpansionDirection("right");
   }
 
@@ -518,7 +537,9 @@ function applyState(
     state.selection;
 
   if (s) {
-    if (
+    if (lineSelected) {
+      $("newText").value = "";
+    } else if (
       options.resetReplacement !== false
     ) {
       $("newText").value =
@@ -915,6 +936,115 @@ async function changePage(delta) {
       err.message
     );
 
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+async function addPageAfterCurrent() {
+  if (!sessionId || !currentState) return;
+
+  setBusy(true, "Adding blank page…");
+  try {
+    const res = await api(`/api/${sessionId}/page/add`, {
+      method: "POST",
+    });
+
+    applyState(await res.json(), {
+      resetReplacement: true,
+      refreshImage: true,
+    });
+    toast("Blank page added after the current page.");
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+async function deleteCurrentPage() {
+  if (!sessionId || !currentState) return;
+
+  if (currentState.page_count <= 1) {
+    toast("The PDF must keep at least one page.");
+    return;
+  }
+
+  const pageNumber = currentState.page_number;
+  if (!window.confirm(`Delete page ${pageNumber}? This removes the whole page.`)) {
+    return;
+  }
+
+  setBusy(true, "Deleting page…");
+  try {
+    const res = await api(`/api/${sessionId}/page/current`, {
+      method: "DELETE",
+    });
+
+    applyState(await res.json(), {
+      resetReplacement: true,
+      refreshImage: true,
+    });
+    toast(`Page ${pageNumber} deleted.`);
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+async function selectFullLine() {
+  if (!sessionId || !currentState?.selection) {
+    toast("Select text in the line first.");
+    return;
+  }
+
+  setBusy(true, "Selecting full line…");
+  try {
+    const res = await api(`/api/${sessionId}/line/select`, {
+      method: "POST",
+    });
+
+    applyState(await res.json(), {
+      resetReplacement: true,
+      refreshImage: false,
+    });
+    toast("Full text line selected.");
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+async function deleteFullLine() {
+  if (!sessionId || !currentState?.line_selected) {
+    toast("Select a full line first.");
+    return;
+  }
+
+  const preview = currentState.selection?.text || "this line";
+  if (!window.confirm(`Delete the full selected line?\n\n${preview}`)) {
+    return;
+  }
+
+  setBusy(true, "Deleting full text line…");
+  try {
+    const res = await api(`/api/${sessionId}/line/delete`, {
+      method: "POST",
+    });
+
+    applyState(await res.json(), {
+      resetReplacement: true,
+      refreshImage: true,
+    });
+    toast("Full text line deleted and validated.");
+  } catch (err) {
+    toast(err.message);
   } finally {
     setBusy(false);
   }
@@ -1960,6 +2090,30 @@ $("nextBtn")
     "click",
     () =>
       changePage(1)
+  );
+
+$("addPageBtn")
+  .addEventListener(
+    "click",
+    addPageAfterCurrent
+  );
+
+$("deletePageBtn")
+  .addEventListener(
+    "click",
+    deleteCurrentPage
+  );
+
+$("selectLineBtn")
+  .addEventListener(
+    "click",
+    selectFullLine
+  );
+
+$("deleteLineBtn")
+  .addEventListener(
+    "click",
+    deleteFullLine
   );
 
 pageImage.addEventListener(

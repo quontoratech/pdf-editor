@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 import os
 import shutil
@@ -827,12 +828,14 @@ class WebEditorSession:
 
         self.selected_span = None
 
+        self.selected_line_spans = []
+
         self.selected_docx_ref = None
 
         self.current_resolution = None
 
         self.undo_stack: list[
-            tuple[bytes, int]
+            tuple[bytes, Any]
         ] = []
 
         self.edit_session = None
@@ -952,6 +955,8 @@ class WebEditorSession:
     def clear_selection(self):
 
         self.selected_span = None
+
+        self.selected_line_spans = []
 
         self.selected_docx_ref = None
 
@@ -1141,6 +1146,7 @@ class WebEditorSession:
     ):
 
         self.selected_span = span
+        self.selected_line_spans = []
 
         self.populate_docx_reference()
 
@@ -1153,6 +1159,267 @@ class WebEditorSession:
         self.status = (
             "Text selected."
         )
+
+    def select_full_line(self):
+        if not self.doc or not self.selected_span:
+            raise ValueError("Select text in the line first.")
+
+        line_spans = self.engine.full_line_spans(
+            self.spans,
+            self.selected_span,
+        )
+        if not line_spans:
+            raise ValueError("The full text line could not be detected.")
+
+        self.selected_line_spans = list(line_spans)
+        self.current_resolution = None
+        self.selected_docx_ref = None
+
+        line_text = " ".join(
+            span.text.strip()
+            for span in self.selected_line_spans
+            if span.text.strip()
+        )
+        self.match_status = (
+            f"✓ FULL LINE SELECTED\n"
+            f"{len(self.selected_line_spans)} text span(s) selected.\n"
+            "Use 'Delete Full Line' to remove this line."
+        )
+        self.match_tone = "success"
+        self.status = f"Full line selected: {line_text[:120]}"
+
+    def _snapshot_pdf_bytes(self):
+        """Serialize Undo state without compacting or renumbering PDF objects."""
+        try:
+            return self.doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+                encryption=pymupdf.PDF_ENCRYPT_KEEP,
+                preserve_metadata=True,
+            )
+        except TypeError:
+            # Older bindings may not accept preserve_metadata, but they still
+            # support no_new_id. Never fall back to a call that mutates /ID.
+            return self.doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+            )
+
+    def _snapshot_for_structural_edit(self):
+        raw = self._snapshot_pdf_bytes()
+        structural_state = {
+            "edits": copy.deepcopy(
+                self.edit_session.edits if self.edit_session else []
+            ),
+            "page_index": int(self.page_index),
+        }
+        self.undo_stack.append((raw, structural_state))
+
+    def add_blank_page_after_current(self):
+        if not self.doc:
+            raise ValueError("No PDF is open.")
+
+        self._snapshot_for_structural_edit()
+        try:
+            current_page = self.doc[self.page_index]
+            rect = current_page.rect
+            insert_index = self.page_index + 1
+
+            if insert_index >= len(self.doc):
+                self.doc.new_page(
+                    pno=-1,
+                    width=float(rect.width),
+                    height=float(rect.height),
+                )
+            else:
+                self.doc.new_page(
+                    pno=insert_index,
+                    width=float(rect.width),
+                    height=float(rect.height),
+                )
+
+            inserted_page_number = insert_index + 1
+            if self.edit_session:
+                self.edit_session.shift_for_page_insert(inserted_page_number)
+                self.edit_session.record_page_operation(
+                    action="add",
+                    page_number=inserted_page_number,
+                    width=float(rect.width),
+                    height=float(rect.height),
+                )
+
+            self.page_index = insert_index
+            self.clear_selection()
+            self.refresh_spans()
+            self.last_output = None
+            self.last_audit = None
+            self.last_validation = None
+            self.status = (
+                f"Added blank page {self.page_index + 1} "
+                f"with size {rect.width:.2f} × {rect.height:.2f} pt."
+            )
+            self.match_status = "Blank page added. Use Undo Last to restore the previous PDF."
+            self.match_tone = "success"
+        except Exception:
+            self._rollback_last_snapshot()
+            raise
+
+    def delete_current_page(self):
+        if not self.doc:
+            raise ValueError("No PDF is open.")
+        if len(self.doc) <= 1:
+            raise ValueError("The PDF must keep at least one page.")
+
+        self._snapshot_for_structural_edit()
+        try:
+            deleted_index = self.page_index
+            deleted_page_number = deleted_index + 1
+            rect = self.doc[deleted_index].rect
+
+            self.doc.delete_page(deleted_index)
+
+            if self.edit_session:
+                self.edit_session.shift_for_page_delete(deleted_page_number)
+                self.edit_session.record_page_operation(
+                    action="delete",
+                    page_number=deleted_page_number,
+                    width=float(rect.width),
+                    height=float(rect.height),
+                )
+
+            self.page_index = min(deleted_index, len(self.doc) - 1)
+            self.clear_selection()
+            self.refresh_spans()
+            self.last_output = None
+            self.last_audit = None
+            self.last_validation = None
+            self.status = f"Deleted page {deleted_page_number}."
+            self.match_status = "Page deleted. Use Undo Last if you want to restore it."
+            self.match_tone = "success"
+        except Exception:
+            self._rollback_last_snapshot()
+            raise
+
+    def delete_selected_line(self):
+        if not self.doc or not self.selected_line_spans:
+            raise ValueError("Select a full line before deleting it.")
+
+        page = self.doc[self.page_index]
+        line_spans = list(self.selected_line_spans)
+        line_text = " ".join(
+            span.text.strip()
+            for span in line_spans
+            if span.text.strip()
+        )
+
+        # Build the visual upward-reflow plan BEFORE changing the PDF.
+        #
+        # Important:
+        # We DO NOT ask FontResolver to re-create the following lines. Those
+        # lines already exist in the PDF with the exact correct font/resources.
+        # PdfEngine copies their original vector/searchable PDF content upward
+        # from a pre-edit snapshot instead. This avoids false failures from
+        # subset fonts, custom encodings, and missing "full" font files.
+        plan = self.engine.plan_delete_line_reflow(
+            self.spans,
+            line_spans,
+            page.rect,
+        )
+
+        prepared_shifted_items = [
+            dict(item)
+            for item in plan.get("shifted_items", [])
+        ]
+
+        # This operation changes PDF content and earlier edit locations,
+        # so keep a complete Undo / rollback snapshot.
+        self._snapshot_for_structural_edit()
+
+        try:
+            result = self.engine.delete_full_line_with_reflow(
+                page,
+                line_spans,
+                prepared_shifted_items,
+            )
+
+            if self.edit_session:
+                page_number = self.page_index + 1
+                deleted_bbox = (
+                    result.get("deleted_bbox")
+                    or plan.get("selected_bbox")
+                    or self.engine.line_bbox(line_spans)
+                )
+
+                # Any earlier edit occupying the deleted line is no longer an
+                # active final-state text edit.
+                self.edit_session.deactivate_for_line_delete(
+                    page_number,
+                    deleted_bbox,
+                )
+
+                # Earlier edits located in lines that moved upward must follow
+                # those new final positions for Save As validation.
+                self.edit_session.shift_for_line_reflow(
+                    page_number,
+                    [item["span"].bbox for item in prepared_shifted_items],
+                    plan.get("shift_dy", 0.0),
+                )
+
+                # Record ONE structural line-reflow operation instead of one
+                # deletion record per span. This prevents numbered prefixes such
+                # as "3." / "4." from creating false old-text validation errors.
+                self.edit_session.record_line_reflow_operation(
+                    page_number=page_number,
+                    deleted_text=(
+                        result.get("deleted_text")
+                        or line_text
+                    ),
+                    deleted_bbox=deleted_bbox,
+                    moved_lines=result.get("moved_lines", []),
+                )
+
+            shifted_count = int(result.get("shifted_count", 0) or 0)
+            renumbered_count = int(result.get("renumbered_count", 0) or 0)
+
+            self.clear_selection()
+            self.refresh_spans()
+            self.last_output = None
+            self.last_audit = None
+            self.last_validation = None
+
+            self.status = f"Deleted full text line: {line_text[:120]}"
+
+            if shifted_count:
+                extra = (
+                    f"Moved {shifted_count} text span(s) upward using the "
+                    "original PDF content."
+                )
+                if renumbered_count:
+                    extra += (
+                        f" Renumbered {renumbered_count} numbered-list "
+                        "prefix span(s)."
+                    )
+            else:
+                extra = "No later text in the same visual content flow needed to move."
+
+            self.match_status = (
+                "✓ FULL LINE DELETED AND REFLOWED\n"
+                f"Removed {len(line_spans)} selected span(s).\n"
+                f"{extra}\n"
+                "No font substitution was used for moved lines.\n"
+                "The resulting searchable text layer was validated immediately."
+            )
+            self.match_tone = "success"
+
+            return result.get("deleted_bbox")
+
+        except Exception:
+            self._rollback_last_snapshot()
+            raise
 
     def populate_docx_reference(
         self,
@@ -1891,20 +2158,7 @@ class WebEditorSession:
 
             try:
 
-                try:
-
-                    snapshot = (
-                        self.doc.tobytes(
-                            garbage=3,
-                            deflate=True,
-                        )
-                    )
-
-                except TypeError:
-
-                    snapshot = (
-                        self.doc.tobytes()
-                    )
+                snapshot = self._snapshot_pdf_bytes()
 
                 self.undo_stack.append(
                     (
@@ -2114,20 +2368,7 @@ class WebEditorSession:
 
         try:
 
-            try:
-
-                snapshot = (
-                    self.doc.tobytes(
-                        garbage=3,
-                        deflate=True,
-                    )
-                )
-
-            except TypeError:
-
-                snapshot = (
-                    self.doc.tobytes()
-                )
+            snapshot = self._snapshot_pdf_bytes()
 
             self.undo_stack.append(
                 (
@@ -2206,15 +2447,19 @@ class WebEditorSession:
         if not self.undo_stack:
             return
 
-        previous, edit_count = (
+        previous, edit_state = (
             self.undo_stack.pop()
         )
 
+        restore_page_index = self.page_index
         if self.edit_session:
-
-            self.edit_session.truncate_edits(
-                edit_count
-            )
+            if isinstance(edit_state, int):
+                self.edit_session.truncate_edits(edit_state)
+            elif isinstance(edit_state, dict):
+                self.edit_session.edits = copy.deepcopy(edit_state.get("edits", []))
+                restore_page_index = int(edit_state.get("page_index", self.page_index))
+            else:
+                self.edit_session.edits = copy.deepcopy(edit_state)
 
         if self.doc:
             self.doc.close()
@@ -2223,6 +2468,7 @@ class WebEditorSession:
             stream=previous,
             filetype="pdf",
         )
+        self.page_index = max(0, min(restore_page_index, len(self.doc) - 1))
 
         self.clear_selection()
 
@@ -2237,15 +2483,19 @@ class WebEditorSession:
                 "to undo."
             )
 
-        previous, edit_count = (
+        previous, edit_state = (
             self.undo_stack.pop()
         )
 
+        restore_page_index = self.page_index
         if self.edit_session:
-
-            self.edit_session.truncate_edits(
-                edit_count
-            )
+            if isinstance(edit_state, int):
+                self.edit_session.truncate_edits(edit_state)
+            elif isinstance(edit_state, dict):
+                self.edit_session.edits = copy.deepcopy(edit_state.get("edits", []))
+                restore_page_index = int(edit_state.get("page_index", self.page_index))
+            else:
+                self.edit_session.edits = copy.deepcopy(edit_state)
 
         if self.doc:
             self.doc.close()
@@ -2254,6 +2504,7 @@ class WebEditorSession:
             stream=previous,
             filetype="pdf",
         )
+        self.page_index = max(0, min(restore_page_index, len(self.doc) - 1))
 
         self.clear_selection()
 
@@ -2494,9 +2745,19 @@ class WebEditorSession:
         if not span:
             return None
 
-        x0, y0, x1, y1 = (
-            span.bbox
-        )
+        line_selected = bool(self.selected_line_spans)
+        if line_selected:
+            bbox = self.engine.line_bbox(self.selected_line_spans) or span.bbox
+            display_text = " ".join(
+                item.text.strip()
+                for item in self.selected_line_spans
+                if item.text.strip()
+            )
+        else:
+            bbox = span.bbox
+            display_text = span.text
+
+        x0, y0, x1, y1 = bbox
 
         family = (
             humanize_pdf_font_name(
@@ -2546,9 +2807,11 @@ class WebEditorSession:
 
         return {
             "text":
-            span.text,
+            display_text,
             "bbox":
-            list(span.bbox),
+            list(bbox),
+            "line_selected":
+            line_selected,
             "internal_font":
             (
                 strip_subset_prefix(
@@ -2596,6 +2859,8 @@ class WebEditorSession:
             self.zoom,
             "selection":
             self._selection_data(),
+            "line_selected":
+            bool(self.selected_line_spans),
             "docx":
             self._docx_data(),
             "resolution":
@@ -3462,6 +3727,70 @@ def select_text(
             status_code=400,
             detail=str(exc),
         ) from exc
+
+
+@app.post(
+    "/api/{sid}/page/add"
+)
+def add_page(
+    sid: str,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.add_blank_page_after_current()
+            return session.state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete(
+    "/api/{sid}/page/current"
+)
+def delete_page(
+    sid: str,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.delete_current_page()
+            return session.state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/{sid}/line/select"
+)
+def select_full_line(
+    sid: str,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.select_full_line()
+            return session.state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/{sid}/line/delete"
+)
+def delete_full_line(
+    sid: str,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.delete_selected_line()
+            return session.state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------

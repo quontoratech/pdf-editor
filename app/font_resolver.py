@@ -592,7 +592,13 @@ class FontResolver:
             return True, [], "No visible replacement glyphs are required."
 
         try:
-            raw = doc.tobytes(garbage=0, deflate=False)
+            # This is a read-only glyph probe. Without no_new_id=True, MuPDF
+            # mutates the live document by creating/updating its trailer /ID.
+            raw = doc.tobytes(
+                garbage=0,
+                deflate=False,
+                no_new_id=True,
+            )
             probe_doc = pymupdf.open(stream=raw, filetype="pdf")
         except Exception as exc:
             return False, visible_chars, f"Could not create glyph probe: {exc}"
@@ -1958,4 +1964,3 @@ class FontResolver:
             missing_chars=missing,
             glyphs_ok=False,
         )
-

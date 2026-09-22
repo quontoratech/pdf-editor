@@ -3,7 +3,7 @@ import tempfile
 
 import pymupdf
 
-from app.clean_edit_session import CleanEditSession, APP_NAME
+from app.clean_edit_session import CleanEditSession
 
 
 PROFILES = [
@@ -105,7 +105,8 @@ def main():
            
             rows.append((profile["name"], after.get("creator"), after.get("producer")))
 
-        # Guard test: sensitive institutional issuer/system identity is not passed through.
+        # Exact-metadata export does not special-case a producer name: the raw
+        # Info/XMP objects are preserved for every input and verified post-save.
         protected = {
             "name": "protected",
             "creator": "Bank of America",
@@ -117,14 +118,14 @@ def main():
         make_pdf(src, protected)
         session = export_copy(src, out)
         after, _ = read_meta(out)
-        assert session.source_metadata_passthrough is False
-        assert after.get("creator") == APP_NAME
-        assert after.get("producer") == APP_NAME
+        assert session.source_metadata_passthrough is True
+        assert after.get("creator") == protected["creator"]
+        assert after.get("producer") == protected["producer"]
 
         print("V3.19 multi-document metadata test: PASS")
         for name, creator, producer in rows:
             print(f"{name}: Creator={creator!r} | Producer={producer!r}")
-        print("protected provenance guard: PASS")
+        print("exact metadata preservation for additional profile: PASS")
 
 
 if __name__ == "__main__":
