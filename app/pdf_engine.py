@@ -18,6 +18,7 @@ from .cff_subset_extender import (
     append_raw_text_stream,
     extend_and_encode,
 )
+from .glyph_outline import draw_text_as_outline
 
 
 class PdfEngine:
@@ -74,15 +75,63 @@ class PdfEngine:
         if not text:
             return 0.0
 
-        if candidate.pdf_refname and candidate.pdf_unicode_widths:
+        if candidate.glyph_candidates:
+            total = 0.0
+            previous = None
+            for char in text:
+                subcandidate = candidate.glyph_candidates.get(char)
+                if subcandidate is None and char.isspace():
+                    subcandidate = previous or next(
+                        iter(candidate.glyph_candidates.values()),
+                        None,
+                    )
+                if subcandidate is None:
+                    return None
+                width = self.replacement_width(subcandidate, char, size)
+                if width is None:
+                    return None
+                total += float(width)
+                previous = subcandidate
+            return total
+
+        if candidate.pdf_refname and candidate.pdf_unicode_widths is not None:
             try:
                 total = 0.0
                 for ch in text:
                     if ch in ("\n", "\r"):
                         return None
-                    if ch not in candidate.pdf_unicode_widths:
+                    if ch in candidate.pdf_unicode_widths:
+                        total += float(candidate.pdf_unicode_widths[ch])
+                        continue
+
+                    # A verified Type1C/CFF subset-extension candidate may have
+                    # been prepared before another edit updated the shared font
+                    # object.  In that case its cached PDF-width map can be
+                    # incomplete even though the exact donor font was already
+                    # verified to contain the character.  Measure only that
+                    # missing character from the same donor; existing characters
+                    # continue to use the original PDF widths above.
+                    if not candidate.extend_original_cff:
                         return None
-                    total += float(candidate.pdf_unicode_widths[ch])
+
+                    donor_width = None
+                    donor_bytes = candidate.subset_extension_font_bytes
+                    donor_path = candidate.subset_extension_font_path or candidate.path
+                    if donor_bytes:
+                        donor_width = font_text_width_from_bytes(
+                            donor_bytes,
+                            ch,
+                            1.0,
+                        )
+                    elif donor_path:
+                        donor_width = font_text_width_from_path(
+                            donor_path,
+                            ch,
+                            1.0,
+                        )
+                    if donor_width is None:
+                        return None
+                    total += float(donor_width)
                 return total * float(size)
             except Exception:
                 return None
@@ -2121,6 +2170,56 @@ class PdfEngine:
         if not text:
             return
 
+        if candidate.glyph_candidates:
+            insert_origin = origin if origin is not None else span.origin
+            current_x, current_y = map(float, insert_origin)
+            direction_x, direction_y = map(float, span.direction or (1.0, 0.0))
+            magnitude = (direction_x * direction_x + direction_y * direction_y) ** 0.5
+            if magnitude <= 1e-9:
+                direction_x, direction_y, magnitude = 1.0, 0.0, 1.0
+            direction_x /= magnitude
+            direction_y /= magnitude
+
+            runs = []
+            previous_candidate = None
+            for char in text:
+                subcandidate = candidate.glyph_candidates.get(char)
+                if subcandidate is None and char.isspace():
+                    subcandidate = previous_candidate or next(
+                        iter(candidate.glyph_candidates.values()),
+                        None,
+                    )
+                if subcandidate is None:
+                    raise ValueError(
+                        f"Composite PDF font has no verified resource for {char!r}."
+                    )
+                if runs and runs[-1][0] is subcandidate:
+                    runs[-1] = (subcandidate, runs[-1][1] + char)
+                else:
+                    runs.append((subcandidate, char))
+                previous_candidate = subcandidate
+
+            for subcandidate, run_text in runs:
+                self._insert_text(
+                    page,
+                    span,
+                    run_text,
+                    subcandidate,
+                    origin=(current_x, current_y),
+                )
+                run_width = self.replacement_width(
+                    subcandidate,
+                    run_text,
+                    span.size,
+                )
+                if run_width is None:
+                    raise ValueError(
+                        "Composite PDF font width could not be measured safely."
+                    )
+                current_x += direction_x * float(run_width)
+                current_y += direction_y * float(run_width)
+            return
+
         color = rgb_from_int(span.color)
         opacity = max(0.0, min(1.0, span.alpha / 255.0))
         rotation = rotation_from_direction(span.direction)
@@ -2136,6 +2235,8 @@ class PdfEngine:
             # one-byte Tj operation. This avoids PyMuPDF re-embedding the font as
             # a new Type0/CID resource.
             extension = extend_and_encode(page.parent, candidate, text)
+            candidate.subset_added_chars = list(extension.added_chars)
+            candidate.subset_added_codes = dict(extension.added_codes)
             repaired_name = self._attach_existing_pdf_font_resource(
                 page,
                 candidate,
@@ -2432,6 +2533,187 @@ class PdfEngine:
             line_index=selected_span.line_index,
             span_index=selected_span.span_index,
         )
+
+    def replace_with_outline_reflow(
+        self,
+        page,
+        selected_span: TextSpan,
+        replacement: str,
+        outline_candidate: FontCandidate,
+        expanded_bbox,
+        shifted_items,
+        replacement_origin=None,
+    ):
+        """Redact selected text and draw the replacement as vector contours.
+
+        This is an explicit last-resort mode. It adds no replacement font
+        resource and no searchable replacement text. Unchanged neighbouring
+        spans are still reinserted with their individually verified fonts.
+        """
+        page.add_redact_annot(
+            pymupdf.Rect(selected_span.bbox),
+            fill=None,
+            cross_out=False,
+        )
+
+        for item in shifted_items:
+            page.add_redact_annot(
+                pymupdf.Rect(item["span"].bbox),
+                fill=None,
+                cross_out=False,
+            )
+
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+            text=pymupdf.PDF_REDACT_TEXT_REMOVE,
+        )
+
+        if replacement_origin is None:
+            replacement_origin = selected_span.origin
+
+        outline_bbox = draw_text_as_outline(
+            page,
+            replacement,
+            outline_candidate,
+            origin=replacement_origin,
+            size=selected_span.size,
+            color=selected_span.color,
+            alpha=selected_span.alpha,
+            direction=selected_span.direction,
+        )
+
+        for item in shifted_items:
+            neighbour = item["span"]
+            dx = float(item["dx"])
+            self._insert_text(
+                page,
+                neighbour,
+                neighbour.text,
+                item["candidate"],
+                origin=(neighbour.origin[0] + dx, neighbour.origin[1]),
+            )
+
+        self._validate_outline_now(
+            page,
+            original_text=selected_span.text,
+            replacement_text=replacement,
+            original_bbox=selected_span.bbox,
+            outline_bbox=outline_bbox,
+            font_size=selected_span.size,
+        )
+
+        final_bbox = pymupdf.Rect(expanded_bbox) | pymupdf.Rect(outline_bbox)
+        return TextSpan(
+            text=replacement,
+            bbox=tuple(final_bbox),
+            origin=tuple(replacement_origin),
+            font=selected_span.font,
+            size=selected_span.size,
+            flags=selected_span.flags,
+            color=selected_span.color,
+            alpha=selected_span.alpha,
+            direction=selected_span.direction,
+            block_index=selected_span.block_index,
+            line_index=selected_span.line_index,
+            span_index=selected_span.span_index,
+        ), tuple(outline_bbox)
+
+    def _validate_outline_now(
+        self,
+        page,
+        *,
+        original_text: str,
+        replacement_text: str,
+        original_bbox,
+        outline_bbox,
+        font_size: float,
+    ):
+        """Serialize/reopen and verify removal plus vector-path presence."""
+        doc = page.parent
+        if doc is None:
+            raise ValueError("Outline replacement cancelled: page is detached.")
+
+        try:
+            raw = doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+            )
+        except TypeError:
+            raw = doc.tobytes(no_new_id=True)
+
+        probe = pymupdf.open(stream=raw, filetype="pdf")
+        try:
+            check_page = probe[int(page.number)]
+            source_rect = pymupdf.Rect(original_bbox)
+            outline_rect = pymupdf.Rect(outline_bbox)
+            clip = pymupdf.Rect(
+                min(source_rect.x0, outline_rect.x0) - 2.0,
+                min(source_rect.y0, outline_rect.y0) - 3.0,
+                max(source_rect.x1, outline_rect.x1) + 4.0,
+                max(source_rect.y1, outline_rect.y1) + max(4.0, float(font_size)),
+            ) & check_page.rect
+
+            old_present = False
+            normalized_old = self._norm_validation_text(original_text)
+            replacement_present = False
+            normalized_replacement = self._norm_validation_text(replacement_text)
+            if normalized_old:
+                region = self._norm_validation_text(
+                    check_page.get_text("text", clip=clip) or ""
+                )
+                old_present = normalized_old in region
+                if not old_present:
+                    try:
+                        old_present = any(
+                            pymupdf.Rect(hit).intersects(clip)
+                            for hit in check_page.search_for(original_text)
+                        )
+                    except Exception:
+                        pass
+
+            if normalized_replacement:
+                outline_text = self._norm_validation_text(
+                    check_page.get_text("text", clip=outline_rect) or ""
+                )
+                replacement_present = normalized_replacement in outline_text
+                if not replacement_present:
+                    try:
+                        replacement_present = any(
+                            pymupdf.Rect(hit).intersects(outline_rect)
+                            for hit in check_page.search_for(replacement_text)
+                        )
+                    except Exception:
+                        pass
+
+            drawing_found = False
+            for drawing in check_page.get_drawings(extended=True):
+                drawing_rect = pymupdf.Rect(drawing.get("rect") or (0, 0, 0, 0))
+                if drawing_rect.is_empty or not drawing_rect.intersects(outline_rect):
+                    continue
+                overlap = drawing_rect & outline_rect
+                ratio = overlap.get_area() / max(0.01, min(
+                    drawing_rect.get_area(), outline_rect.get_area()
+                ))
+                if ratio >= 0.50:
+                    drawing_found = True
+                    break
+
+            if old_present or replacement_present or not drawing_found:
+                reasons = []
+                if old_present:
+                    reasons.append("original text is still searchable")
+                if replacement_present:
+                    reasons.append("replacement was added to the searchable text layer")
+                if not drawing_found:
+                    reasons.append("replacement vector outline is missing")
+                raise ValueError(
+                    "Outline replacement cancelled: " + "; ".join(reasons) + "."
+                )
+        finally:
+            probe.close()
 
     def replace_with_multiline_reflow(
         self,

@@ -235,11 +235,17 @@
           </div>
 
           <div class="stack-actions">
-            <button id="loadFontBtn" class="btn" disabled>Load Exact TTF/OTF Font...</button>
-            <button id="dbFontBtn" class="btn" disabled>Search Font from DB...</button>
+            <button id="loadFontBtn" class="btn" disabled>1. Upload Exact Font...</button>
+            <button id="pdfGlyphBtn" class="btn" disabled>2. Find Glyph Elsewhere in PDF</button>
+            <button id="closestFontBtn" class="btn" disabled>3. Complete Original Subset from DB</button>
+            <button id="outlineGlyphBtn" class="btn" disabled>4. Convert Missing Glyph to Outline</button>
+            <button id="dbFontBtn" class="btn" disabled>Browse Saved Font DB...</button>
             <button id="findFontBtn" class="btn" disabled>Search Exact Font with AI...</button>
             <button id="checkBtn" class="btn" disabled>Re-check Font Match</button>
           </div>
+          <small class="direction-help">
+            Exact font and PDF-subset completion keep searchable text and retain the original font resource. Outline keeps visible glyph shapes but the replacement is not searchable/selectable text.
+          </small>
           <div id="matchStatus" class="notice neutral prewrap">Select text to begin.</div>
           <button id="replaceBtn" class="btn primary large" disabled>Replace Text (Clean)</button>
         </section>

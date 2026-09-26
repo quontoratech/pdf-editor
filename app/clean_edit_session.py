@@ -470,16 +470,14 @@ class CleanEditSession:
 
         for xref in range(1, int(doc.xref_length())):
             try:
-                keys = doc.xref_get_keys(xref)
-            except Exception:
-                keys = ()
-            if not keys:
-                free_xrefs += 1
-
-            try:
                 object_text = doc.xref_object(xref, compressed=False) or ""
             except Exception:
                 object_text = ""
+            # Arrays, strings and numeric indirect objects legitimately have
+            # no dictionary keys (CID font /Widths arrays are a common case).
+            # Count only an actually empty/null xref entry as unreachable/free.
+            if object_text.strip() in {"", "null"}:
+                free_xrefs += 1
             redaction_records += len(
                 re.findall(r"/Subtype\s*/Redact\b", object_text)
             )
@@ -689,6 +687,8 @@ class CleanEditSession:
         font_size: float,
         color: int,
         mode: str,
+        subset_font_xref: int | None = None,
+        subset_added_chars: list[str] | None = None,
     ) -> None:
         # If this text edit touches content that was previously moved by a
         # structural line-reflow operation, that old moved-line text is no
@@ -700,26 +700,73 @@ class CleanEditSession:
             reason="superseded by a later text edit",
         )
 
+        record = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "page": int(page_number),
+            "original_text": original_text,
+            "replacement_text": replacement_text,
+            "original_bbox": [float(v) for v in original_bbox],
+            "final_bbox": [float(v) for v in final_bbox],
+            "origin": [float(v) for v in origin],
+            "font_family": font_family,
+            "font_face": font_face,
+            "font_source": font_source,
+            "font_size_pt": float(font_size),
+            "color_rgb_int": int(color),
+            "edit_mode": mode,
+        }
+        if subset_font_xref is not None:
+            record["subset_font_xref"] = int(subset_font_xref)
+            record["subset_added_chars"] = list(subset_added_chars or [])
+            record["subset_existing_glyphs_preserved"] = True
+        self.edits.append(record)
+
+    def truncate_edits(self, count: int) -> None:
+        del self.edits[int(count):]
+
+    def record_outline_edit(
+        self,
+        *,
+        page_number: int,
+        original_text: str,
+        replacement_text: str,
+        original_bbox,
+        final_bbox,
+        outline_bbox,
+        origin,
+        font_family: str | None,
+        font_face: str | None,
+        font_source: str | None,
+        font_size: float,
+        color: int,
+    ) -> None:
+        """Record an explicit non-searchable vector-outline replacement."""
+        self._deactivate_overlapping_line_reflow_expectations(
+            page_number=int(page_number),
+            bboxes=[original_bbox, final_bbox, outline_bbox],
+            reason="superseded by a later outline edit",
+        )
         self.edits.append(
             {
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "operation_type": "outline",
                 "page": int(page_number),
-                "original_text": original_text,
-                "replacement_text": replacement_text,
+                "original_text": str(original_text or ""),
+                "replacement_text": str(replacement_text or ""),
                 "original_bbox": [float(v) for v in original_bbox],
                 "final_bbox": [float(v) for v in final_bbox],
+                "outline_bbox": [float(v) for v in outline_bbox],
                 "origin": [float(v) for v in origin],
                 "font_family": font_family,
                 "font_face": font_face,
                 "font_source": font_source,
                 "font_size_pt": float(font_size),
                 "color_rgb_int": int(color),
-                "edit_mode": mode,
+                "searchable_replacement": False,
+                "immediate_validation_passed": True,
+                "edit_mode": "clean-redaction-vector-outline",
             }
         )
-
-    def truncate_edits(self, count: int) -> None:
-        del self.edits[int(count):]
 
     def record_page_operation(
         self,
@@ -808,7 +855,7 @@ class CleanEditSession:
         inserted_page_number = int(inserted_page_number)
 
         for edit in self.edits:
-            if edit.get("operation_type", "text") not in {"text", "line_reflow"}:
+            if edit.get("operation_type", "text") not in {"text", "outline", "line_reflow"}:
                 continue
             if edit.get("inactive"):
                 continue
@@ -820,7 +867,7 @@ class CleanEditSession:
         deleted_page_number = int(deleted_page_number)
 
         for edit in self.edits:
-            if edit.get("operation_type", "text") not in {"text", "line_reflow"}:
+            if edit.get("operation_type", "text") not in {"text", "outline", "line_reflow"}:
                 continue
             if edit.get("inactive"):
                 continue
@@ -935,7 +982,7 @@ class CleanEditSession:
 
             op_type = edit.get("operation_type", "text")
 
-            if op_type == "text":
+            if op_type in {"text", "outline"}:
                 final_bbox = edit.get("final_bbox")
                 if not final_bbox:
                     continue
@@ -972,7 +1019,7 @@ class CleanEditSession:
 
             op_type = edit.get("operation_type", "text")
 
-            if op_type == "text":
+            if op_type in {"text", "outline"}:
                 final_bbox = edit.get("final_bbox")
                 if not final_bbox:
                     continue
@@ -1559,12 +1606,14 @@ class CleanEditSession:
 
         superseded_by: dict[int, int] = {}
 
+        final_state_types = {"text", "outline"}
+
         for old_index, old_edit in enumerate(edits):
-            if old_edit.get("operation_type", "text") != "text" or old_edit.get("inactive"):
+            if old_edit.get("operation_type", "text") not in final_state_types or old_edit.get("inactive"):
                 continue
             for later_index in range(old_index + 1, len(edits)):
                 later_edit = edits[later_index]
-                if later_edit.get("operation_type", "text") != "text" or later_edit.get("inactive"):
+                if later_edit.get("operation_type", "text") not in final_state_types or later_edit.get("inactive"):
                     continue
                 if _same_edit_location(old_edit, later_edit):
                     superseded_by[old_index] = later_index
@@ -1771,6 +1820,144 @@ class CleanEditSession:
 
                     continue
 
+                if operation_type == "outline":
+                    pno = int(edit["page"])
+                    if pno < 1 or pno > len(doc):
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | Outline validation failed | "
+                            "Issue: target page no longer exists."
+                        )
+                        checks.append(
+                            {
+                                "edit": idx,
+                                "page": pno,
+                                "operation_type": "outline",
+                                "passed": False,
+                                "reason": "target page no longer exists",
+                            }
+                        )
+                        continue
+
+                    if zero_index in superseded_by:
+                        checks.append(
+                            {
+                                "edit": idx,
+                                "page": pno,
+                                "operation_type": "outline",
+                                "superseded": True,
+                                "superseded_by_edit": superseded_by[zero_index] + 1,
+                                "validation_scope": "audit-history-only",
+                                "passed": True,
+                            }
+                        )
+                        continue
+
+                    page = doc[pno - 1]
+                    original_rect = _rect(edit["original_bbox"])
+                    outline_rect = _rect(edit["outline_bbox"])
+                    clip = pymupdf.Rect(
+                        min(original_rect.x0, outline_rect.x0) - 2.0,
+                        min(original_rect.y0, outline_rect.y0) - 3.0,
+                        max(original_rect.x1, outline_rect.x1) + 4.0,
+                        max(original_rect.y1, outline_rect.y1)
+                        + max(4.0, float(edit["font_size_pt"])),
+                    ) & page.rect
+
+                    norm_old = _norm_text(edit.get("original_text", ""))
+                    region_text = _norm_text(page.get_text("text", clip=clip) or "")
+                    old_present = bool(norm_old and norm_old in region_text)
+                    norm_replacement = _norm_text(edit.get("replacement_text", ""))
+                    outline_text = _norm_text(
+                        page.get_text("text", clip=outline_rect) or ""
+                    )
+                    replacement_present = bool(
+                        norm_replacement and norm_replacement in outline_text
+                    )
+                    old_hits = []
+                    if norm_old:
+                        try:
+                            old_hits = [
+                                tuple(hit)
+                                for hit in page.search_for(edit["original_text"])
+                                if pymupdf.Rect(hit).intersects(clip)
+                            ]
+                        except Exception:
+                            pass
+                    replacement_hits = []
+                    if norm_replacement:
+                        try:
+                            replacement_hits = [
+                                tuple(hit)
+                                for hit in page.search_for(edit["replacement_text"])
+                                if pymupdf.Rect(hit).intersects(outline_rect)
+                            ]
+                        except Exception:
+                            pass
+
+                    matching_drawings = []
+                    try:
+                        drawings = page.get_drawings(extended=True)
+                    except TypeError:
+                        drawings = page.get_drawings()
+                    for drawing in drawings:
+                        drawing_rect = pymupdf.Rect(
+                            drawing.get("rect") or (0, 0, 0, 0)
+                        )
+                        if drawing_rect.is_empty or not drawing_rect.intersects(outline_rect):
+                            continue
+                        overlap = drawing_rect & outline_rect
+                        ratio = overlap.get_area() / max(
+                            0.01,
+                            min(drawing_rect.get_area(), outline_rect.get_area()),
+                        )
+                        if ratio >= 0.50:
+                            matching_drawings.append(tuple(drawing_rect))
+
+                    passed = (
+                        not old_present
+                        and not old_hits
+                        and not replacement_present
+                        and not replacement_hits
+                        and bool(matching_drawings)
+                        and bool(edit.get("immediate_validation_passed"))
+                    )
+                    checks.append(
+                        {
+                            "edit": idx,
+                            "page": pno,
+                            "operation_type": "outline",
+                            "superseded": False,
+                            "searchable_replacement_expected": False,
+                            "replacement_absent_from_text_layer": (
+                                not replacement_present and not replacement_hits
+                            ),
+                            "old_text_absent_in_region": not old_present,
+                            "old_search_hits_in_region": len(old_hits),
+                            "matching_vector_drawings": len(matching_drawings),
+                            "immediate_validation_passed": bool(
+                                edit.get("immediate_validation_passed")
+                            ),
+                            "passed": passed,
+                        }
+                    )
+                    if not passed:
+                        reasons = []
+                        if old_present or old_hits:
+                            reasons.append("original text is still searchable")
+                        if replacement_present or replacement_hits:
+                            reasons.append(
+                                "replacement is present in the searchable text layer"
+                            )
+                        if not matching_drawings:
+                            reasons.append("replacement vector outline is missing")
+                        if not edit.get("immediate_validation_passed"):
+                            reasons.append("immediate outline validation did not pass")
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | Outline validation failed | "
+                            f"Issue: {'; '.join(reasons)}."
+                        )
+                    continue
+
                 # ---------------------------------------------------------
                 # Normal text-edit validation
                 # ---------------------------------------------------------
@@ -1954,6 +2141,7 @@ class CleanEditSession:
                 continue
             if edit.get("operation_type", "text") not in {
                 "text",
+                "outline",
                 "line_reflow",
             }:
                 continue
@@ -2618,7 +2806,11 @@ class CleanEditSession:
         source_copied_verbatim = bool(not self.edits and not doc.is_dirty)
         has_active_content_edits = any(
             not edit.get("inactive")
-            and edit.get("operation_type", "text") in {"text", "line_reflow"}
+            and edit.get("operation_type", "text") in {
+                "text",
+                "outline",
+                "line_reflow",
+            }
             for edit in self.edits
         )
         empty_annots_removed = 0

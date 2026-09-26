@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import math
 import os
 import shutil
@@ -39,18 +40,22 @@ except ImportError:
 
 
 from app.clean_edit_session import CleanEditSession, APP_NAME
+from app.cff_subset_extender import extension_unicode_widths, inspect_existing_cff
 from app.docx_reference import DocxReferenceIndex
 from app.env import load_env_file
 from app.font_resolver import FontResolver, humanize_pdf_font_name
 from app.online_font_resolver import OnlineFontResolver
 from app.font_utils import (
+    font_path_has_text,
     font_flags_text,
+    normalize_font_name,
     strip_subset_prefix,
     weight_label,
     weight_from_flags,
     italic_from_flags,
 )
 from app.pdf_engine import PdfEngine
+from app.models import FontResolution
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -121,6 +126,7 @@ class PageRequest(BaseModel):
 class TextRequest(BaseModel):
     replacement: str
     direction: str = "right"
+    fallback_token: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -594,6 +600,77 @@ class FontLibraryStore:
         target.write_bytes(data)
         return target, record
 
+    def best_compatible_font(
+        self,
+        *,
+        replacement: str,
+        target_family: str,
+        target_weight: int,
+        target_italic: bool,
+        destination_dir: Path,
+    ):
+        """Return the closest stored face that covers every requested glyph."""
+        if not replacement:
+            raise ValueError("Enter replacement text before choosing a fallback font.")
+        target_norm = normalize_font_name(target_family)
+        ranked = []
+        for record in self.fonts.find({}):
+            names = [
+                record.get("family"),
+                record.get("full_name"),
+                record.get("postscript"),
+            ]
+            name_scores = []
+            for name in names:
+                current = normalize_font_name(name)
+                if not current:
+                    continue
+                if target_norm and current == target_norm:
+                    name_scores.append(1.0)
+                elif target_norm:
+                    name_scores.append(
+                        difflib.SequenceMatcher(None, target_norm, current).ratio()
+                    )
+                else:
+                    name_scores.append(0.0)
+            similarity = max(name_scores or [0.0])
+            weight_delta = abs(int(record.get("weight") or 400) - int(target_weight))
+            italic_penalty = 0 if bool(record.get("italic")) == bool(target_italic) else 600
+            score = (1.0 - similarity) * 1000.0 + weight_delta + italic_penalty
+            ranked.append((score, record, similarity))
+
+        ranked.sort(key=lambda item: (item[0], str(item[1].get("_id", ""))))
+        missing_reports = []
+        for score, record, similarity in ranked:
+            path, materialized = self.materialize_font(
+                str(record["_id"]),
+                destination_dir,
+            )
+            glyphs_ok, missing = font_path_has_text(str(path), replacement)
+            if glyphs_ok:
+                candidate_weight = int(record.get("weight") or 400)
+                target_weight = int(target_weight)
+                weight_delta = abs(candidate_weight - target_weight)
+                return path, materialized, {
+                    "score": float(score),
+                    "family_similarity": float(similarity),
+                    "weight_delta": weight_delta,
+                    "target_weight": target_weight,
+                    "candidate_weight": candidate_weight,
+                    "italic_match": bool(record.get("italic")) == bool(target_italic),
+                }
+            if missing:
+                missing_reports.append((record.get("full_name") or record.get("family"), missing))
+
+        preview = "; ".join(
+            f"{name}: {' '.join(repr(ch) for ch in missing[:6])}"
+            for name, missing in missing_reports[:3]
+        )
+        raise ValueError(
+            "No saved MongoDB font contains every replacement glyph."
+            + (f" Checked examples: {preview}" if preview else "")
+        )
+
 
 _auth_store: AuthStore | None = None
 
@@ -834,6 +911,10 @@ class WebEditorSession:
 
         self.current_resolution = None
 
+        # Explicit, replacement-bound fallback selected by the user. It is
+        # never reused when the replacement string or selection changes.
+        self.approved_fallback = None
+
         self.undo_stack: list[
             tuple[bytes, Any]
         ] = []
@@ -961,6 +1042,8 @@ class WebEditorSession:
         self.selected_docx_ref = None
 
         self.current_resolution = None
+
+        self.approved_fallback = None
 
         self.match_status = (
             "Select text to begin."
@@ -1145,6 +1228,7 @@ class WebEditorSession:
         span,
     ):
 
+        self.approved_fallback = None
         self.selected_span = span
         self.selected_line_spans = []
 
@@ -1173,6 +1257,7 @@ class WebEditorSession:
 
         self.selected_line_spans = list(line_spans)
         self.current_resolution = None
+        self.approved_fallback = None
         self.selected_docx_ref = None
 
         line_text = " ".join(
@@ -1498,6 +1583,7 @@ class WebEditorSession:
         )
 
         self.current_resolution = None
+        self.approved_fallback = None
 
         self.match_status = (
             "Exact font loaded.\n"
@@ -1541,6 +1627,8 @@ class WebEditorSession:
             if replacement is None
             else str(replacement)
         )
+
+        self.approved_fallback = None
 
         if (
             self.selected_docx_ref
@@ -1748,6 +1836,8 @@ class WebEditorSession:
 
             return None
 
+        self.approved_fallback = None
+
         if replacement is None:
             replacement = ""
 
@@ -1921,6 +2011,8 @@ class WebEditorSession:
 
             self.current_resolution = None
 
+            self.approved_fallback = None
+
             self.match_status = (
                 "Text changed. Click "
                 "'Re-check Font Match' "
@@ -1932,6 +2024,245 @@ class WebEditorSession:
             self.match_tone = (
                 "warning"
             )
+
+    def target_font_profile(self):
+        if not self.selected_span:
+            raise ValueError("Select PDF text first.")
+        if self.selected_docx_ref and self.selected_docx_ref.family:
+            family = self.selected_docx_ref.family
+            weight = (
+                700 if self.selected_docx_ref.bold is True
+                else 400 if self.selected_docx_ref.bold is False
+                else weight_from_flags(self.selected_span.flags)
+            )
+            italic = (
+                bool(self.selected_docx_ref.italic)
+                if self.selected_docx_ref.italic is not None
+                else italic_from_flags(self.selected_span.flags)
+            )
+        else:
+            family = (
+                humanize_pdf_font_name(self.selected_span.font)
+                or strip_subset_prefix(self.selected_span.font)
+                or ""
+            )
+            weight = weight_from_flags(self.selected_span.flags)
+            italic = italic_from_flags(self.selected_span.flags)
+        return family, int(weight), bool(italic)
+
+    def find_glyph_elsewhere_in_pdf(self, replacement: str):
+        if not self.doc or not self.selected_span:
+            raise ValueError("Select PDF text before searching its embedded fonts.")
+        page = self.doc[self.page_index]
+        replacement = str(replacement or "")
+
+        # A Type1C subset may already contain the outlines even when its current
+        # one-byte Encoding / ToUnicode maps cannot emit the requested text.
+        # Prefer that exact original resource and let the CFF writer allocate
+        # only the missing byte mappings.
+        candidate = self.font_resolver._original_cff_candidate_if_encodable(
+            self.doc,
+            page,
+            self.selected_span,
+            replacement,
+        )
+        if candidate:
+            note = (
+                f"The original PDF font /{candidate.pdf_refname} already contains "
+                "every requested glyph outline. Only its unused character mappings "
+                "will be completed; no font resource will be substituted."
+            )
+            missing = []
+        else:
+            candidate, note, missing = (
+                self.font_resolver._existing_pdf_resource_candidate(
+                    self.doc,
+                    page,
+                    self.selected_span,
+                    replacement,
+                )
+            )
+
+        precise_cff_missing = []
+        selected_font_record = self.font_resolver.find_page_font(
+            page,
+            self.selected_span,
+        )
+        if selected_font_record:
+            selected_xref = int(selected_font_record.get("xref", 0) or 0)
+            if selected_xref > 0:
+                _can_encode, precise_cff_missing, _widths = inspect_existing_cff(
+                    self.doc,
+                    selected_xref,
+                    replacement,
+                )
+        if not candidate:
+            composite_candidate, composite_note, composite_missing = (
+                self.font_resolver.composite_pdf_resource_candidate(
+                    self.doc,
+                    page,
+                    self.selected_span,
+                    replacement,
+                )
+            )
+            if composite_candidate:
+                candidate = composite_candidate
+                note = composite_note
+                missing = []
+            elif composite_missing:
+                note = composite_note
+                missing = composite_missing
+        if not candidate:
+            self.current_resolution = None
+            self.approved_fallback = None
+            if precise_cff_missing:
+                missing = list(precise_cff_missing)
+                note = (
+                    "The original embedded CFF subset is missing the listed glyphs, "
+                    "and no directly reusable same-family resource elsewhere in "
+                    "this PDF supplies them. Use 'Complete Original Subset from DB' "
+                    "or upload/search the exact full font."
+                )
+            preview = " ".join(repr(ch) for ch in missing[:12])
+            raise ValueError(
+                note + (f" Missing glyphs: {preview}." if preview else "")
+            )
+
+        resolution = FontResolution(
+            ok=True,
+            candidate=candidate,
+            exact_family=True,
+            exact_weight=True,
+            exact_style=True,
+            glyphs_ok=True,
+            source_note="Find Glyph Elsewhere in PDF: " + note,
+        )
+        self.current_resolution = resolution
+        self.approved_fallback = {
+            "mode": "pdf_glyph_resource",
+            "replacement": replacement,
+            "token": secrets.token_urlsafe(16),
+            "candidate": candidate,
+            "resolution": resolution,
+        }
+        self.match_status = (
+            "✓ GLYPHS FOUND ELSEWHERE IN PDF\n"
+            f"Font: {candidate.display_name}\n"
+            "No external font file will be added.\n"
+            + note
+        )
+        self.match_tone = "success"
+        self.status = "A verified same-family PDF font subset is ready."
+        return resolution
+
+    def approve_database_fallback(
+        self,
+        *,
+        candidate,
+        replacement: str,
+        record: dict,
+        score: dict,
+        mode: str,
+    ):
+        if not self.selected_span:
+            raise ValueError("Select PDF text first.")
+        if mode not in {"closest_font", "outline"}:
+            raise ValueError("Unsupported font fallback mode.")
+
+        # Keep the resolver's saved/manual candidate immutable. Fallback
+        # preparation is approval-specific and must not leak into later edits.
+        candidate = copy.copy(candidate)
+
+        family_similarity = float(score.get("family_similarity", 0.0))
+        family_exact = family_similarity >= 0.995
+        subset_completion = False
+
+        # Preferred path for the statement-style Type1C PDFs: retain the
+        # selected PDF's actual font resource and append only glyph programs
+        # that its subset does not already contain. Existing glyphs, byte codes,
+        # widths and page resource names remain the original ones.
+        if mode == "closest_font" and family_exact:
+            page = self.doc[self.page_index]
+            prepared = self.font_resolver._cff_subset_extension_candidate(
+                page,
+                self.selected_span,
+                candidate,
+            )
+            if getattr(prepared, "extend_original_cff", False):
+                candidate = prepared
+                candidate.pdf_unicode_widths = extension_unicode_widths(
+                    self.doc,
+                    candidate,
+                    replacement,
+                )
+                subset_completion = True
+
+        if mode == "closest_font" and not subset_completion:
+            raise ValueError(
+                "The selected PDF font cannot be completed safely in-place from "
+                "this database face. No full-line font substitution was applied. "
+                "Use an exact full font / AI exact-font search, or use vector "
+                "outline mode when selectable text is not required."
+            )
+
+        source_label = (
+            "MongoDB donor for original PDF subset completion"
+            if subset_completion
+            else "MongoDB vector-outline source"
+        )
+        candidate.source = source_label
+        if subset_completion:
+            source_note = (
+                f"Original PDF Type1C subset completion using {candidate.display_name}. "
+                "Only missing glyph programs and their encoding/ToUnicode entries "
+                "will be appended to the original /F# resource; existing glyphs "
+                "remain untouched."
+            )
+        else:
+            source_note = (
+                f"Explicit {source_label}. Selected {candidate.display_name}; "
+                f"family similarity {family_similarity:.3f}."
+            )
+        resolution = FontResolution(
+            ok=True,
+            candidate=candidate,
+            exact_family=family_exact,
+            exact_weight=bool(score.get("weight_delta", 9999) <= 100),
+            exact_style=bool(score.get("italic_match")),
+            glyphs_ok=True,
+            source_note=source_note,
+        )
+        self.current_resolution = resolution
+        self.approved_fallback = {
+            "mode": mode,
+            "replacement": str(replacement or ""),
+            "token": secrets.token_urlsafe(16),
+            "candidate": candidate,
+            "resolution": resolution,
+            "font_id": str(record.get("_id", "")),
+        }
+
+        if mode == "outline":
+            self.match_status = (
+                "✓ VECTOR OUTLINE MODE READY\n"
+                f"Outline source: {candidate.display_name}\n"
+                + "The replacement will look like glyphs but will not be searchable "
+                "or selectable as text. No replacement font resource will be embedded."
+            )
+            self.status = "Vector-outline fallback approved for this replacement only."
+            self.match_tone = "warning"
+        elif subset_completion:
+            self.match_status = (
+                "✓ ORIGINAL PDF SUBSET COMPLETION READY\n"
+                f"Donor glyph source: {candidate.display_name}\n"
+                f"Original resource: /{candidate.pdf_refname} "
+                f"(xref {candidate.pdf_xref})\n"
+                "Only characters missing from the original embedded subset will "
+                "be appended. Existing glyphs will still use the original font."
+            )
+            self.status = "Missing-glyph completion is ready for the original PDF subset."
+            self.match_tone = "success"
+        return resolution
 
     def _record_clean_edit(
         self,
@@ -1972,12 +2303,23 @@ class WebEditorSession:
             color=
             original_span.color,
             mode=mode,
+            subset_font_xref=(
+                candidate.pdf_xref
+                if getattr(candidate, "extend_original_cff", False)
+                else None
+            ),
+            subset_added_chars=(
+                getattr(candidate, "subset_added_chars", None)
+                if getattr(candidate, "extend_original_cff", False)
+                else None
+            ),
         )
 
     def replace_selected_text(
         self,
         replacement: str,
         expansion_direction: str = "right",
+        fallback_token: str | None = None,
     ):
 
         if (
@@ -2004,9 +2346,26 @@ class WebEditorSession:
                 "Expansion direction must be 'right' or 'left'."
             )
 
-        self.resolve_selected_font(
-            replacement
+        approved_fallback = self.approved_fallback
+        fallback_matches = bool(
+            approved_fallback
+            and approved_fallback.get("replacement") == str(replacement or "")
+            and fallback_token
+            and secrets.compare_digest(
+                str(approved_fallback.get("token") or ""),
+                str(fallback_token),
+            )
+            and approved_fallback.get("candidate")
+            and approved_fallback.get("resolution")
         )
+
+        if fallback_matches:
+            self.current_resolution = approved_fallback["resolution"]
+        else:
+            self.approved_fallback = None
+            self.resolve_selected_font(
+                replacement
+            )
 
         if (
             not self.current_resolution
@@ -2024,6 +2383,12 @@ class WebEditorSession:
         selected_candidate = (
             self.current_resolution
             .candidate
+        )
+
+        fallback_mode = (
+            approved_fallback.get("mode")
+            if fallback_matches
+            else None
         )
 
         span = self.selected_span
@@ -2171,31 +2536,70 @@ class WebEditorSession:
                     )
                 )
 
-                updated_span = (
-                    self.engine
-                    .replace_with_horizontal_reflow(
-                        page,
+                if fallback_mode == "outline":
+                    updated_span, outline_bbox = (
+                        self.engine.replace_with_outline_reflow(
+                            page,
+                            span,
+                            replacement,
+                            selected_candidate,
+                            horizontal_plan["expanded_bbox"],
+                            shifted_items,
+                            replacement_origin=horizontal_plan.get(
+                                "replacement_origin"
+                            ),
+                        )
+                    )
+                    self.edit_session.record_outline_edit(
+                        page_number=self.page_index + 1,
+                        original_text=span.text,
+                        replacement_text=replacement,
+                        original_bbox=span.bbox,
+                        final_bbox=updated_span.bbox,
+                        outline_bbox=outline_bbox,
+                        origin=updated_span.origin,
+                        font_family=selected_candidate.family,
+                        font_face=selected_candidate.display_name,
+                        font_source=selected_candidate.source,
+                        font_size=span.size,
+                        color=span.color,
+                    )
+                else:
+                    updated_span = (
+                        self.engine
+                        .replace_with_horizontal_reflow(
+                            page,
+                            span,
+                            replacement,
+                            selected_candidate,
+                            horizontal_plan[
+                                "expanded_bbox"
+                            ],
+                            shifted_items,
+                            replacement_origin=
+                            horizontal_plan.get(
+                                "replacement_origin"
+                            ),
+                        )
+                    )
+
+                    self._record_clean_edit(
                         span,
+                        updated_span,
                         replacement,
                         selected_candidate,
-                        horizontal_plan[
-                            "expanded_bbox"
-                        ],
-                        shifted_items,
-                        replacement_origin=
-                        horizontal_plan.get(
-                            "replacement_origin"
+                        (
+                            "clean-redaction-horizontal-subset-completion"
+                            if getattr(
+                                selected_candidate,
+                                "extend_original_cff",
+                                False,
+                            )
+                            else "clean-redaction-horizontal-closest-font"
+                            if fallback_mode == "closest_font"
+                            else "clean-redaction-horizontal"
                         ),
                     )
-                )
-
-                self._record_clean_edit(
-                    span,
-                    updated_span,
-                    replacement,
-                    selected_candidate,
-                    "clean-redaction-horizontal",
-                )
 
                 self.selected_span = (
                     updated_span
@@ -2203,13 +2607,19 @@ class WebEditorSession:
 
                 self.refresh_spans()
 
+                self.approved_fallback = None
+
                 moved_count = len(
                     shifted_items
                 )
 
                 self.match_status = (
-                    "✓ CLEAN REPLACEMENT APPLIED\n"
-                    f"Font size kept at "
+                    (
+                        "✓ VECTOR OUTLINE REPLACEMENT APPLIED\n"
+                        if fallback_mode == "outline"
+                        else "✓ CLEAN REPLACEMENT APPLIED\n"
+                    )
+                    + f"Font size kept at "
                     f"{span.size:.4f} pt.\n"
                     f"Container width: "
                     f"{span.bbox[2]-span.bbox[0]:.2f}"
@@ -2223,6 +2633,11 @@ class WebEditorSession:
                         else
                         "Following spans shifted "
                         f"right: {moved_count}\n"
+                    )
+                    + (
+                        "Searchable replacement: no (vector outline)\n"
+                        if fallback_mode == "outline"
+                        else ""
                     )
                     + "Font source: "
                     f"{selected_candidate.source}"
@@ -2242,6 +2657,15 @@ class WebEditorSession:
                     + " Use Save As when ready."
                 )
 
+                if fallback_mode == "outline":
+                    # Vector paths are intentionally not selectable PDF text.
+                    # Drop the synthetic text selection so a later replacement
+                    # cannot accidentally be layered over the existing paths.
+                    self.selected_span = None
+                    self.selected_line_spans = []
+                    self.selected_docx_ref = None
+                    self.current_resolution = None
+
                 return
 
             except Exception:
@@ -2256,6 +2680,16 @@ class WebEditorSession:
                     "reason",
                     "There is not enough safe space to expand this text to the left.",
                 )
+            )
+
+        if fallback_mode == "outline":
+            raise ValueError(
+                horizontal_plan.get(
+                    "reason",
+                    "The outline replacement cannot fit safely on this line.",
+                )
+                + " Vector-outline fallback does not perform multiline text reflow. "
+                "Use a shorter replacement or free horizontal space."
             )
 
         paragraph_spans = (
@@ -2397,7 +2831,17 @@ class WebEditorSession:
                 updated_span,
                 replacement,
                 selected_candidate,
-                "clean-redaction-multiline",
+                (
+                    "clean-redaction-multiline-subset-completion"
+                    if getattr(
+                        selected_candidate,
+                        "extend_original_cff",
+                        False,
+                    )
+                    else "clean-redaction-multiline-closest-font"
+                    if fallback_mode == "closest_font"
+                    else "clean-redaction-multiline"
+                ),
             )
 
             self.selected_span = (
@@ -2405,6 +2849,8 @@ class WebEditorSession:
             )
 
             self.refresh_spans()
+
+            self.approved_fallback = None
 
             self.match_status = (
                 "✓ CLEAN REPLACEMENT APPLIED "
@@ -2696,6 +3142,8 @@ class WebEditorSession:
 
             return {
                 "mode": mode,
+                "fallback_mode": None,
+                "fallback_token": None,
                 "family": "-",
                 "face": "-",
                 "weight": "-",
@@ -2710,6 +3158,16 @@ class WebEditorSession:
         return {
             "mode":
             mode,
+            "fallback_mode": (
+                self.approved_fallback.get("mode")
+                if self.approved_fallback
+                else None
+            ),
+            "fallback_token": (
+                self.approved_fallback.get("token")
+                if self.approved_fallback
+                else None
+            ),
             "family":
             (
                 candidate.family
@@ -3593,6 +4051,90 @@ def load_saved_font(
         raise HTTPException(status_code=400, detail=f"Could not load saved font: {exc}") from exc
 
 
+@app.post("/api/{sid}/font-find-pdf")
+def find_font_glyphs_in_pdf(
+    sid: str,
+    req: TextRequest,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.find_glyph_elsewhere_in_pdf(req.replacement)
+            return session.state()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _prepare_database_fallback(
+    session: WebEditorSession,
+    req: TextRequest,
+    *,
+    mode: str,
+):
+    if mode == "outline" and not str(req.replacement or "").strip():
+        raise ValueError("Vector-outline fallback requires visible replacement text.")
+    family, weight, italic = session.target_font_profile()
+    path, record, score = _get_font_store().best_compatible_font(
+        replacement=req.replacement,
+        target_family=family,
+        target_weight=weight,
+        target_italic=italic,
+        destination_dir=session.session_dir,
+    )
+    candidate = session.font_resolver.add_manual_font(str(path))
+    session.approve_database_fallback(
+        candidate=candidate,
+        replacement=req.replacement,
+        record=record,
+        score=score,
+        mode=mode,
+    )
+    return {
+        "font": _public_font_record(record),
+        "score": score,
+        "state": session.state(),
+    }
+
+
+@app.post("/api/{sid}/font-db-closest")
+def use_closest_database_font(
+    sid: str,
+    req: TextRequest,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            return _prepare_database_fallback(session, req, mode="closest_font")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not complete the original PDF font subset: {exc}",
+        ) from exc
+
+
+@app.post("/api/{sid}/font-outline")
+def prepare_vector_outline(
+    sid: str,
+    req: TextRequest,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            return _prepare_database_fallback(session, req, mode="outline")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not prepare the vector outline: {exc}",
+        ) from exc
+
+
 @app.get(
     "/api/{sid}/state"
 )
@@ -3899,6 +4441,8 @@ def replace_text(
                 req.replacement,
                 expansion_direction=
                 req.direction,
+                fallback_token=
+                req.fallback_token,
             )
 
             return (

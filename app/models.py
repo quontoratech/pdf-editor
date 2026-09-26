@@ -65,6 +65,13 @@ class FontCandidate:
     subset_extension_font_path: Optional[str] = None
     subset_extension_font_bytes: Optional[bytes] = field(default=None, repr=False)
 
+    # Explicit same-family composite assembled from verified PDF resources.
+    # Each replacement character maps to the resource that visibly rendered it.
+    glyph_candidates: Optional[dict[str, "FontCandidate"]] = field(
+        default=None,
+        repr=False,
+    )
+
     @property
     def display_name(self) -> str:
         return (

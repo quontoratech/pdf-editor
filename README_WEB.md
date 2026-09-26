@@ -40,7 +40,10 @@ PDF_EDITOR_PORT=9000 python main.py
 - Previous / next page
 - Zoom 60–250%
 - Load DOCX reference
-- Load exact TTF/OTF font
+- Upload an exact TTF/OTF font and persist it in the MongoDB font library
+- Find verified same-family glyphs in one or more subsets elsewhere in the PDF
+- Complete an original Type1C/CFF subset from an exact-family MongoDB glyph donor
+- Convert missing-glyph replacements to audited vector outlines
 - Re-check exact font match
 - Clean text replacement using the existing `PdfEngine`
 - Horizontal and multiline reflow using the existing engine
@@ -48,6 +51,19 @@ PDF_EDITOR_PORT=9000 python main.py
 - Save/export PDF using the existing `CleanEditSession`
 - Download audit and validation JSON sidecars
 - Browser full-screen mode
+
+Vector-outline fallback is intentionally non-searchable and non-selectable. It
+redacts the source text, draws filled glyph contours from a compatible saved
+TTF/OTF, and does not embed a replacement font resource. Catalog/Info/XMP, xref
+style, compression policy, and untouched pages remain covered by the normal
+structure-preservation checks.
+
+For embedded Type1C/CFF fonts, an exact-family MongoDB donor is not substituted
+for the whole line. The editor appends only glyph programs missing from the
+original subset and writes the replacement through that original `/F#` resource.
+The explicit OpenAI exact-font search follows the same path when it finds and
+license-verifies the correct full face; OpenAI is not used to invent arbitrary
+font outlines.
 
 ## VPS deployment
 

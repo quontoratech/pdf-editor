@@ -8,6 +8,8 @@ from pathlib import Path
 import pymupdf
 
 from app.clean_edit_session import CleanEditSession
+from app.font_resolver import SystemFontIndex
+from app.font_utils import font_path_has_text
 from app.models import FontCandidate
 from app.pdf_engine import PdfEngine
 
@@ -516,6 +518,85 @@ def main():
         assert validation["text_ok"] is True
         assert text_checks[0]["superseded"] is False
         assert text_checks[1]["superseded"] is False
+
+        # Explicit missing-glyph fallback: replace searchable source text with
+        # filled vector contours from a local/DB-style TTF without embedding a
+        # replacement font resource. The validator checks both source removal
+        # and the reopened vector drawing.
+        source = root / "outline-source.pdf"
+        output = root / "outline-output.pdf"
+        make_source(source, xref_stream=False)
+        outline_candidate = next(
+            candidate
+            for candidate in SystemFontIndex().iter_candidates()
+            if candidate.path
+            and font_path_has_text(candidate.path, "Vector Omega Ω")[0]
+        )
+        session = CleanEditSession(str(source))
+        doc = pymupdf.open(source)
+        page = doc[0]
+        span = next(
+            item for item in engine.extract_spans(page)
+            if item.text == "Original line"
+        )
+        width = engine.replacement_width(
+            outline_candidate,
+            "Vector Omega Ω",
+            span.size,
+        )
+        plan = engine.plan_horizontal_expansion(
+            page,
+            engine.extract_spans(page),
+            span,
+            width,
+            expansion_direction="right",
+        )
+        assert plan["ok"] is True
+        updated_span, outline_bbox = engine.replace_with_outline_reflow(
+            page,
+            span,
+            "Vector Omega Ω",
+            outline_candidate,
+            plan["expanded_bbox"],
+            [],
+            replacement_origin=plan["replacement_origin"],
+        )
+        session.record_outline_edit(
+            page_number=1,
+            original_text=span.text,
+            replacement_text="Vector Omega Ω",
+            original_bbox=span.bbox,
+            final_bbox=updated_span.bbox,
+            outline_bbox=outline_bbox,
+            origin=updated_span.origin,
+            font_family=outline_candidate.family,
+            font_face=outline_candidate.display_name,
+            font_source="test database outline source",
+            font_size=span.size,
+            color=span.color,
+        )
+        _, audit_path, validation_path = session.export_clean(doc, str(output))
+        doc.close()
+
+        outline_check = pymupdf.open(output)
+        try:
+            assert "Original line" not in outline_check[0].get_text("text")
+            assert "Vector Omega" not in outline_check[0].get_text("text")
+            assert outline_check[0].get_drawings()
+            assert "Untouched line" in outline_check[1].get_text("text")
+        finally:
+            outline_check.close()
+
+        validation = json.loads(Path(validation_path).read_text(encoding="utf-8"))
+        assert validation["text_ok"] is True
+        outline_validation = next(
+            item for item in validation["checks"]
+            if item.get("operation_type") == "outline"
+        )
+        assert outline_validation["matching_vector_drawings"] >= 1
+        assert outline_validation["passed"] is True
+        audit = json.loads(Path(audit_path).read_text(encoding="utf-8"))
+        assert audit["edits"][0]["searchable_replacement"] is False
 
         # Missing structural metadata must stay missing: export must not create
         # an Info dictionary, XMP packet, or trailer ID as a side effect.

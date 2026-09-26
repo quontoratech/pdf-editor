@@ -24,7 +24,7 @@ from .font_utils import (
     italic_from_flags,
 )
 from .models import FontCandidate, FontResolution, TextSpan, DocxFontReference
-from .cff_subset_extender import inspect_existing_cff
+from .cff_subset_extender import inspect_existing_cff, extension_unicode_widths
 from .online_font_resolver import OnlineFontResolver
 
 
@@ -829,6 +829,118 @@ class FontResolver:
 
         return None, note, best_missing
 
+    def composite_pdf_resource_candidate(
+        self,
+        doc,
+        page,
+        span: TextSpan,
+        replacement_text: str,
+    ):
+        """Assemble one searchable line from multiple same-family PDF subsets.
+
+        Every visible character is independently raster-probed against existing
+        resources. Only resources already present in the PDF are reused.
+        """
+        if not replacement_text:
+            return None, "Replacement text is empty.", []
+        if "\n" in replacement_text or "\r" in replacement_text:
+            return None, "Composite PDF-subset mode supports one line only.", []
+
+        records = self._matching_pdf_font_records(doc, page, span)
+        if not records:
+            return None, "No same-family PDF subsets were found.", []
+
+        candidate_by_xref = {}
+        glyph_candidates = {}
+        missing = []
+
+        for char in replacement_text:
+            if char.isspace() or char in glyph_candidates:
+                continue
+
+            # PyMuPDF's existing-resource width table is indexed by a
+            # 16-bit character code. Avoid allocating an unbounded table or
+            # approving a resource that cannot be emitted safely.
+            if ord(char) > 65535:
+                missing.append(char)
+                continue
+
+            selected = None
+            for record in records:
+                xref = int(record.get("xref", 0) or 0)
+                if xref <= 0:
+                    continue
+                glyphs_ok, _missing, _note = self._probe_pdf_font_xref(
+                    doc,
+                    xref,
+                    char,
+                )
+                if not glyphs_ok:
+                    continue
+
+                selected = candidate_by_xref.get(xref)
+                if selected is None:
+                    try:
+                        widths = doc.get_char_widths(
+                            xref,
+                            limit=max(256, ord(char) + 1),
+                        )
+                    except Exception:
+                        widths = None
+                    if not widths:
+                        continue
+                    family = humanize_pdf_font_name(record.get("basefont", ""))
+                    selected = FontCandidate(
+                        path=None,
+                        family=family or humanize_pdf_font_name(span.font),
+                        full_name=(
+                            strip_subset_prefix(record.get("basefont", ""))
+                            or strip_subset_prefix(span.font)
+                        ),
+                        postscript=(
+                            strip_subset_prefix(record.get("basefont", ""))
+                            or strip_subset_prefix(span.font)
+                        ),
+                        weight=weight_from_flags(span.flags),
+                        italic=italic_from_flags(span.flags),
+                        source="Verified PDF glyph subset",
+                        pdf_refname=f"V311F{xref}",
+                        pdf_xref=xref,
+                        pdf_char_widths=widths,
+                    )
+                    candidate_by_xref[xref] = selected
+
+                glyph_candidates[char] = selected
+                break
+
+            if selected is None:
+                missing.append(char)
+
+        if missing:
+            return None, (
+                f"Checked {len(records)} same-family PDF subset(s), but the "
+                "combined resources still do not cover every character."
+            ), missing
+
+        if not glyph_candidates:
+            return None, "No visible replacement glyphs were requested.", []
+
+        resources = {candidate.pdf_xref for candidate in glyph_candidates.values()}
+        composite = FontCandidate(
+            path=None,
+            family=humanize_pdf_font_name(span.font),
+            full_name="Composite PDF subsets",
+            postscript=strip_subset_prefix(span.font),
+            weight=weight_from_flags(span.flags),
+            italic=italic_from_flags(span.flags),
+            source="Verified same-family PDF glyph subsets",
+            glyph_candidates=glyph_candidates,
+        )
+        return composite, (
+            f"Combined {len(resources)} verified same-family PDF font resource(s) "
+            "at the original baseline; no external font was embedded."
+        ), []
+
 
 
     def _original_cff_candidate_if_encodable(self, doc, page, span: TextSpan, replacement_text: str):
@@ -877,13 +989,6 @@ class FontResolver:
         embedded Type1C simple font, return the full candidate unchanged.
         """
         if not full_candidate:
-            return full_candidate
-
-        # Automatically downloaded open fonts are used as normal verified font
-        # resources. Never splice their glyphs into an existing PDF subset.
-        # This keeps online lookup useful for ordinary/synthetic PDFs without
-        # pretending a same-named public font is the original embedded program.
-        if getattr(full_candidate, "_online_download", False):
             return full_candidate
 
         record = self.find_page_font(page, span)
@@ -1003,6 +1108,12 @@ class FontResolver:
                 candidate.path,
                 replacement_text,
             )
+            if glyphs_ok:
+                resolved.pdf_unicode_widths = extension_unicode_widths(
+                    page.parent,
+                    resolved,
+                    replacement_text,
+                )
         elif getattr(candidate, "path", None):
             glyphs_ok, missing = font_path_has_text(
                 candidate.path,
@@ -1602,6 +1713,12 @@ class FontResolver:
 
                 if glyphs_ok and weight_ok and italic_ok:
                     resolved_system = self._cff_subset_extension_candidate(page, span, system)
+                    if getattr(resolved_system, "extend_original_cff", False):
+                        resolved_system.pdf_unicode_widths = extension_unicode_widths(
+                            page.parent,
+                            resolved_system,
+                            replacement_text,
+                        )
                     return FontResolution(
                         ok=True,
                         candidate=resolved_system,
@@ -1631,9 +1748,20 @@ class FontResolver:
                 italic_ok = online.italic == target_italic
 
                 if glyphs_ok and weight_ok and italic_ok:
+                    resolved_online = self._cff_subset_extension_candidate(
+                        page,
+                        span,
+                        online,
+                    )
+                    if getattr(resolved_online, "extend_original_cff", False):
+                        resolved_online.pdf_unicode_widths = extension_unicode_widths(
+                            page.parent,
+                            resolved_online,
+                            replacement_text,
+                        )
                     return FontResolution(
                         ok=True,
-                        candidate=online,
+                        candidate=resolved_online,
                         exact_family=True,
                         exact_weight=True,
                         exact_style=True,
@@ -1642,6 +1770,12 @@ class FontResolver:
                             "DOCX Reference Mode: exact open font family was not "
                             "available locally, so it was automatically downloaded, "
                             "verified and cached. "
+                            + (
+                                "Only missing glyphs will be appended to the original "
+                                "Type1C/CFF subset. "
+                                if getattr(resolved_online, "extend_original_cff", False)
+                                else ""
+                            )
                             + (online_note or "")
                         ),
                     )
@@ -1827,6 +1961,12 @@ class FontResolver:
 
                 if glyphs_ok and weight_ok and italic_ok:
                     resolved_system = self._cff_subset_extension_candidate(page, span, system)
+                    if getattr(resolved_system, "extend_original_cff", False):
+                        resolved_system.pdf_unicode_widths = extension_unicode_widths(
+                            page.parent,
+                            resolved_system,
+                            replacement_text,
+                        )
                     return FontResolution(
                         ok=True,
                         candidate=resolved_system,
@@ -1863,9 +2003,20 @@ class FontResolver:
                 italic_ok = online.italic == target_italic
 
                 if glyphs_ok and weight_ok and italic_ok:
+                    resolved_online = self._cff_subset_extension_candidate(
+                        page,
+                        span,
+                        online,
+                    )
+                    if getattr(resolved_online, "extend_original_cff", False):
+                        resolved_online.pdf_unicode_widths = extension_unicode_widths(
+                            page.parent,
+                            resolved_online,
+                            replacement_text,
+                        )
                     return FontResolution(
                         ok=True,
-                        candidate=online,
+                        candidate=resolved_online,
                         exact_family=True,
                         exact_weight=True,
                         exact_style=True,
@@ -1874,8 +2025,12 @@ class FontResolver:
                             "PDF-Only Exact Font Mode: the readable PDF family name "
                             f"'{readable_pdf_family}' matched an approved open font "
                             "that was automatically downloaded, verified and cached. "
-                            "It will be embedded as a normal font resource; online "
-                            "glyphs are not spliced into the original PDF subset. "
+                            + (
+                                "Only missing glyphs will be appended to the original "
+                                "Type1C/CFF subset. "
+                                if getattr(resolved_online, "extend_original_cff", False)
+                                else "It will be embedded as a normal font resource. "
+                            )
                             + (online_note or "")
                         ),
                     )
@@ -1898,6 +2053,12 @@ class FontResolver:
 
         if fingerprint_candidate:
             resolved_fingerprint = self._cff_subset_extension_candidate(page, span, fingerprint_candidate)
+            if getattr(resolved_fingerprint, "extend_original_cff", False):
+                resolved_fingerprint.pdf_unicode_widths = extension_unicode_widths(
+                    page.parent,
+                    resolved_fingerprint,
+                    replacement_text,
+                )
             return FontResolution(
                 ok=True,
                 candidate=resolved_fingerprint,

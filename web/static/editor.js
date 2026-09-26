@@ -497,6 +497,15 @@ function applyState(
   $("dbFontBtn").disabled =
     !canReplaceSelection;
 
+  $("pdfGlyphBtn").disabled =
+    !canReplaceSelection;
+
+  $("closestFontBtn").disabled =
+    !canReplaceSelection;
+
+  $("outlineGlyphBtn").disabled =
+    !canReplaceSelection;
+
   $("findFontBtn").disabled =
     !canReplaceSelection;
 
@@ -505,6 +514,11 @@ function applyState(
 
   $("replaceBtn").disabled =
     !canReplaceSelection;
+
+  $("replaceBtn").textContent =
+    state.resolution?.fallback_mode === "outline"
+      ? "Replace as Vector Outline"
+      : "Replace Text (Clean)";
 
   $("newText").disabled =
     !canReplaceSelection;
@@ -1261,6 +1275,80 @@ async function useSavedFont(fontId, button) {
   }
 }
 
+async function findGlyphElsewhereInPdf() {
+  if (!sessionId || !currentState?.selection) return;
+  setBusy(true, "Scanning all PDF font subsets…");
+  try {
+    const res = await api(`/api/${sessionId}/font-find-pdf`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        replacement: $("newText").value,
+        direction: getExpansionDirection(),
+      }),
+    });
+    applyState(await res.json(), {
+      resetReplacement: false,
+      refreshImage: false,
+    });
+    toast("A verified same-family glyph subset was found inside this PDF.");
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function prepareDatabaseFallback(mode) {
+  if (!sessionId || !currentState?.selection) return;
+
+  if (mode === "closest_font") {
+    const accepted = window.confirm(
+      "Complete the original PDF font subset from MongoDB?\n\n" +
+      "For an exact-family Type1C font, only missing glyphs are appended to the original subset. " +
+      "If safe subset completion is not possible, the edit will be rejected; the whole line will not be substituted."
+    );
+    if (!accepted) return;
+  } else {
+    const accepted = window.confirm(
+      "Convert the replacement to vector outlines?\n\n" +
+      "The result stays visible and printable but will NOT be searchable, selectable, or editable as normal PDF text."
+    );
+    if (!accepted) return;
+  }
+
+  const endpoint = mode === "outline" ? "font-outline" : "font-db-closest";
+  const busyText = mode === "outline"
+    ? "Preparing vector glyph outlines…"
+    : "Finding donor glyphs for the original PDF subset…";
+  setBusy(true, busyText);
+
+  try {
+    const res = await api(`/api/${sessionId}/${endpoint}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        replacement: $("newText").value,
+        direction: getExpansionDirection(),
+      }),
+    });
+    const data = await res.json();
+    applyState(data.state, {
+      resetReplacement: false,
+      refreshImage: false,
+    });
+    toast(
+      mode === "outline"
+        ? "Outline mode is ready. Click Replace as Vector Outline."
+        : `Database glyph donor ready: ${data.font.full_name || data.font.family}.`
+    );
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
 // ---------------------------------------------------------
 // NORMAL FONT CHECK
 // THIS DOES NOT USE THE AI ENDPOINT
@@ -1442,7 +1530,9 @@ async function replaceText() {
               replacement:
                 $("newText").value,
               direction:
-                getExpansionDirection()
+                getExpansionDirection(),
+              fallback_token:
+                currentState?.resolution?.fallback_token || null
             })
         }
       );
@@ -1642,6 +1732,8 @@ function markReplacementChanged() {
 
   currentState.resolution = {
     ...currentState.resolution,
+    fallback_mode: null,
+    fallback_token: null,
     family: "-",
     face: "-",
     weight: "-",
@@ -1679,6 +1771,9 @@ function markReplacementChanged() {
     $("matchStatus"),
     "warning"
   );
+
+  $("replaceBtn").textContent =
+    "Replace Text (Clean)";
 }
 
 
@@ -2030,6 +2125,24 @@ $("dbFontBtn")
   .addEventListener(
     "click",
     openFontDbModal
+  );
+
+$("pdfGlyphBtn")
+  .addEventListener(
+    "click",
+    findGlyphElsewhereInPdf
+  );
+
+$("closestFontBtn")
+  .addEventListener(
+    "click",
+    () => prepareDatabaseFallback("closest_font")
+  );
+
+$("outlineGlyphBtn")
+  .addEventListener(
+    "click",
+    () => prepareDatabaseFallback("outline")
   );
 
 $("closeFontDbModalBtn")

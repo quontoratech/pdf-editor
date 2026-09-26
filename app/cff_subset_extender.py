@@ -22,6 +22,7 @@ from typing import Dict, Iterable, Tuple
 import pymupdf
 from fontTools.cffLib import CFFFontSet
 from fontTools.pens.t2CharStringPen import T2CharStringPen
+from fontTools.pens.transformPen import TransformPen
 from fontTools.ttLib import TTFont
 
 
@@ -384,7 +385,25 @@ def extend_and_encode(doc, candidate, text: str) -> ExtensionResult:
                 )
             advance = float(hmtx[source_glyph][0]) * 1000.0 / upem
             pen = T2CharStringPen(advance, glyph_set)
-            glyph_set[source_glyph].draw(pen)
+            # TTF/OTF donors commonly use 2048 units/em while PDF Type1C
+            # charstrings conventionally use a 1000-unit glyph space. Writing
+            # donor coordinates directly made only the appended characters
+            # roughly 2x too large. Scale the complete outline (including
+            # composite-component transforms) into the target CFF glyph space.
+            donor_to_cff = 1000.0 / upem
+            glyph_set[source_glyph].draw(
+                TransformPen(
+                    pen,
+                    (
+                        donor_to_cff,
+                        0.0,
+                        0.0,
+                        donor_to_cff,
+                        0.0,
+                        0.0,
+                    ),
+                )
+            )
             charstring = pen.getCharString(
                 private=top.Private,
                 globalSubrs=top.GlobalSubrs,
@@ -537,3 +556,45 @@ def inspect_existing_cff(doc, font_xref: int, text: str):
         return (not missing), missing, widths
     except Exception:
         return False, list(dict.fromkeys(text)), {}
+
+
+def extension_unicode_widths(doc, candidate, text: str) -> Dict[str, float]:
+    """Measure a pending subset extension without mutating the PDF.
+
+    Existing characters use the original PDF font's widths. Only characters
+    absent from that subset use the donor font's advance. Values are returned
+    in em units for ``PdfEngine.replacement_width``.
+    """
+    if not getattr(candidate, "pdf_xref", None):
+        raise CffSubsetExtensionError("Extension candidate has no PDF font xref.")
+
+    _can_encode, _missing, widths = inspect_existing_cff(
+        doc,
+        int(candidate.pdf_xref),
+        text,
+    )
+    widths = dict(widths or {})
+    needed = [
+        char
+        for char in dict.fromkeys(text)
+        if char not in ("\n", "\r") and char not in widths
+    ]
+    if not needed:
+        return widths
+
+    full_font = _full_font_source(candidate)
+    try:
+        cmap = full_font.getBestCmap() or {}
+        hmtx = full_font["hmtx"].metrics
+        upem = float(full_font["head"].unitsPerEm)
+        for char in needed:
+            glyph_name = cmap.get(ord(char))
+            if glyph_name is None:
+                raise CffSubsetExtensionError(
+                    f"Verified donor font does not contain {char!r}."
+                )
+            widths[char] = float(hmtx[glyph_name][0]) / upem
+    finally:
+        full_font.close()
+
+    return widths
