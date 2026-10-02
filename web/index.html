@@ -231,20 +231,53 @@
 
           <div class="stack-actions">
             <button id="selectLineBtn" class="btn" disabled>Select Full Line</button>
+            <button
+              id="addRowBelowBtn"
+              class="btn"
+              type="button"
+              title="Select an existing table row first; its cells and styling become the template for the new row."
+              aria-describedby="rowInsertHelp"
+              disabled
+            >Add Full Row Below</button>
             <button id="deleteLineBtn" class="btn" disabled>Delete Full Line</button>
+            <button
+              id="deleteTableLineModeBtn"
+              class="btn"
+              type="button"
+              aria-pressed="false"
+              title="Activate this mode, then click a horizontal table line on the PDF."
+              disabled
+            >Delete Table Line…</button>
+          </div>
+          <small id="rowInsertHelp" class="direction-help" aria-live="polite">
+            To add a row, select text in an existing table row and click Select Full Line. The new row will clone every detected cell, so tables with 2, 3, 4, 5, or more columns keep their original widths, fonts, alignment, and separator style. Edit each cloned cell normally afterward.
+          </small>
+          <small class="direction-help">
+            If text is already gone but a horizontal table line remains, activate this mode and click each line on the PDF. Use the same button or Escape to cancel.
+          </small>
+
+          <div class="direction-picker table-rule-picker">
+            <span>Table line behavior</span>
+            <label class="direction-option">
+              <input id="removeTableRule" type="checkbox" disabled />
+              <span>Remove the separator directly below this row</span>
+            </label>
+            <small class="direction-help">
+              By default, horizontal table lines move upward with their rows. Check this only when the selected row's separator should disappear. Unrelated page graphics are left unchanged.
+            </small>
           </div>
 
           <div class="stack-actions">
             <button id="loadFontBtn" class="btn" disabled>1. Upload Exact Font...</button>
             <button id="pdfGlyphBtn" class="btn" disabled>2. Find Glyph Elsewhere in PDF</button>
-            <button id="closestFontBtn" class="btn" disabled>3. Complete Original Subset from DB</button>
+            <button id="closestFontBtn" class="btn" disabled>3. Match Missing Glyph Weight from DB</button>
             <button id="outlineGlyphBtn" class="btn" disabled>4. Convert Missing Glyph to Outline</button>
             <button id="dbFontBtn" class="btn" disabled>Browse Saved Font DB...</button>
             <button id="findFontBtn" class="btn" disabled>Search Exact Font with AI...</button>
             <button id="checkBtn" class="btn" disabled>Re-check Font Match</button>
           </div>
           <small class="direction-help">
-            Exact font and PDF-subset completion keep searchable text and retain the original font resource. Outline keeps visible glyph shapes but the replacement is not searchable/selectable text.
+            Exact font and calibrated PDF/DB glyph completion keep searchable text and retain the original font resource. Only missing outlines are added; existing glyphs are not redrawn. Outline mode keeps visible shapes but is not searchable/selectable text.
           </small>
           <div id="matchStatus" class="notice neutral prewrap">Select text to begin.</div>
           <button id="replaceBtn" class="btn primary large" disabled>Replace Text (Clean)</button>

@@ -4,6 +4,8 @@ let currentUser = null;
 let zoom = 1.35;
 let toastTimer = null;
 let savedFontsCache = [];
+let tableLineDeleteMode = false;
+let tableLineDeletePending = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -51,6 +53,8 @@ function resetEditorUi() {
   sessionId = null;
   currentState = null;
   zoom = 1.35;
+  tableLineDeleteMode = false;
+  tableLineDeletePending = false;
 
   $("zoomSlider").value = "135";
 
@@ -90,12 +94,21 @@ function resetEditorUi() {
     "hidden"
   );
 
+  $("addRowBelowBtn").disabled = true;
+  $("addRowBelowBtn").textContent = "Add Full Row Below";
+  setText(
+    "rowInsertHelp",
+    "To add a row, select text in an existing table row and click Select Full Line. " +
+    "The row is cloned as an exact template, so any number of columns is handled automatically."
+  );
+
   pageImage.removeAttribute(
     "src"
   );
 
   setExpansionDirection("right");
   setExpansionDirectionEnabled(false);
+  syncTableLineDeleteModeUi();
 }
 
 
@@ -363,6 +376,7 @@ function updateSelectionOverlay() {
     currentState?.selection;
 
   if (
+    tableLineDeleteMode ||
     !selection ||
     !pageImage.complete ||
     !pageImage.naturalWidth
@@ -485,11 +499,65 @@ function applyState(
   $("deletePageBtn").disabled =
     !hasPdf || state.page_count <= 1;
 
+  if (!hasPdf) {
+    tableLineDeleteMode = false;
+  }
+
+  syncTableLineDeleteModeUi();
+
   $("selectLineBtn").disabled =
     !hasSelection;
 
   $("deleteLineBtn").disabled =
     !lineSelected;
+
+  const rowInsert = state.row_insert || {};
+  const rowColumnCount = Math.max(
+    0,
+    Number(rowInsert.column_count || 0)
+  );
+  const canAddTableRow =
+    lineSelected && rowInsert.eligible === true;
+
+  $("addRowBelowBtn").disabled =
+    !canAddTableRow;
+
+  $("addRowBelowBtn").textContent =
+    canAddTableRow && rowColumnCount > 0
+      ? `Add Full Row Below (${rowColumnCount} column${rowColumnCount === 1 ? "" : "s"})`
+      : "Add Full Row Below";
+
+  if (!lineSelected) {
+    setText(
+      "rowInsertHelp",
+      "To add a row, select text in an existing table row and click Select Full Line. " +
+      "The row is cloned as an exact template, so any number of columns is handled automatically."
+    );
+  } else if (canAddTableRow) {
+    setText(
+      "rowInsertHelp",
+      `Detected ${rowColumnCount} table column${rowColumnCount === 1 ? "" : "s"}. ` +
+      "Add Full Row Below clones the selected row with its exact PDF font resources, " +
+      "column positions, alignment, and separator style. Then click each cloned cell to edit its value."
+    );
+  } else {
+    setText(
+      "rowInsertHelp",
+      rowInsert.reason ||
+      "This full line is not a safely detected multi-column table row, so a row cannot be inserted from it."
+    );
+  }
+
+  $("removeTableRule").disabled =
+    !lineSelected;
+
+  if (
+    lineSelected &&
+    options.resetLineDeleteOptions !== false
+  ) {
+    $("removeTableRule").checked =
+      state.line_delete_options?.remove_table_rule_default === true;
+  }
 
   $("loadFontBtn").disabled =
     !canReplaceSelection;
@@ -739,6 +807,10 @@ async function uploadPdf(file) {
 
     sessionId =
       data.session_id;
+
+    // A delete mode belongs to the PDF session in which it was activated.
+    tableLineDeleteMode = false;
+    tableLineDeletePending = false;
 
     zoom =
       1.35;
@@ -1042,7 +1114,13 @@ async function deleteFullLine() {
   }
 
   const preview = currentState.selection?.text || "this line";
-  if (!window.confirm(`Delete the full selected line?\n\n${preview}`)) {
+  const removeTableRule = $("removeTableRule").checked;
+  const tableRuleSummary = removeTableRule
+    ? "If this is a table row, its separator will be removed and later table lines will move upward with the remaining rows."
+    : "If this is a table row, all detected table lines will move upward with the remaining rows.";
+  if (!window.confirm(
+    `Delete the full selected line?\n\n${preview}\n\n${tableRuleSummary}`
+  )) {
     return;
   }
 
@@ -1050,16 +1128,195 @@ async function deleteFullLine() {
   try {
     const res = await api(`/api/${sessionId}/line/delete`, {
       method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        remove_table_rule: removeTableRule,
+      }),
     });
 
     applyState(await res.json(), {
       resetReplacement: true,
       refreshImage: true,
     });
-    toast("Full text line deleted and validated.");
+    toast("Full text line and table geometry deleted/reflowed and validated.");
   } catch (err) {
     toast(err.message);
   } finally {
+    setBusy(false);
+  }
+}
+
+
+async function addFullRowBelow() {
+  if (!sessionId || !currentState?.line_selected) {
+    toast("Select a full table row first.");
+    return;
+  }
+
+  const rowInsert = currentState.row_insert || {};
+  if (rowInsert.eligible !== true) {
+    toast(
+      rowInsert.reason ||
+      "The selected line is not a safely detected multi-column table row."
+    );
+    return;
+  }
+
+  const columnCount = Math.max(0, Number(rowInsert.column_count || 0));
+  const preview = currentState.selection?.text || "the selected row";
+  const accepted = window.confirm(
+    `Add a new row below this ${columnCount}-column table row?\n\n` +
+    `${preview}\n\n` +
+    "The tool will clone the selected row's existing PDF content and separator style, " +
+    "then move later rows down without substituting fonts. Afterward, click each cloned cell " +
+    "and replace its text normally."
+  );
+  if (!accepted) return;
+
+  setBusy(true, `Adding ${columnCount}-column table row…`);
+  try {
+    const res = await api(`/api/${sessionId}/line/add-row`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({position: "below"}),
+    });
+
+    applyState(await res.json(), {
+      resetReplacement: true,
+      refreshImage: true,
+    });
+    toast(
+      `Added a ${columnCount}-column row. Click each new cell to edit its copied value.`
+    );
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+
+function syncTableLineDeleteModeUi() {
+  const button = $("deleteTableLineModeBtn");
+  if (!button) return;
+
+  const hasPdf =
+    !!sessionId &&
+    !!currentState &&
+    currentState.page_count > 0;
+
+  if (!hasPdf) {
+    tableLineDeleteMode = false;
+  }
+
+  button.disabled = !hasPdf || tableLineDeletePending;
+  button.classList.toggle("primary", tableLineDeleteMode);
+  button.setAttribute(
+    "aria-pressed",
+    tableLineDeleteMode ? "true" : "false"
+  );
+  button.textContent = tableLineDeleteMode
+    ? "Cancel Table-Line Delete"
+    : "Delete Table Line…";
+
+  pageImage.style.cursor = tableLineDeleteMode
+    ? "cell"
+    : "crosshair";
+}
+
+
+function setTableLineDeleteMode(active, announce = true) {
+  const hasPdf =
+    !!sessionId &&
+    !!currentState &&
+    currentState.page_count > 0;
+
+  tableLineDeleteMode = Boolean(active && hasPdf);
+  syncTableLineDeleteModeUi();
+  updateSelectionOverlay();
+
+  if (!announce) return;
+
+  if (tableLineDeleteMode) {
+    setText(
+      "status",
+      "Table-line delete mode: click a horizontal table line on the PDF. " +
+      "The mode stays active for additional lines."
+    );
+    toast("Click a horizontal table line to delete it. Click Cancel when finished.");
+  } else {
+    setText(
+      "status",
+      currentState?.status || "Table-line delete mode cancelled."
+    );
+    toast("Table-line delete mode cancelled.");
+  }
+}
+
+
+function pdfPointFromImageEvent(event) {
+  const rect = pageImage.getBoundingClientRect();
+  const renderedX = event.clientX - rect.left;
+  const renderedY = event.clientY - rect.top;
+  const scaleX = pageImage.naturalWidth / pageImage.clientWidth;
+  const scaleY = pageImage.naturalHeight / pageImage.clientHeight;
+
+  return {
+    x: (renderedX * scaleX) / zoom,
+    y: (renderedY * scaleY) / zoom,
+  };
+}
+
+
+async function deleteTableLineAt(event) {
+  if (
+    !tableLineDeleteMode ||
+    tableLineDeletePending ||
+    !sessionId ||
+    !currentState
+  ) {
+    return;
+  }
+
+  const {x, y} = pdfPointFromImageEvent(event);
+  tableLineDeletePending = true;
+  syncTableLineDeleteModeUi();
+  setBusy(true, "Deleting horizontal table line…");
+
+  try {
+    const res = await api(`/api/${sessionId}/table-line/delete`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({x, y}),
+    });
+
+    applyState(await res.json(), {
+      resetReplacement: true,
+      refreshImage: true,
+    });
+    toast("Table line deleted. Click another line, or cancel the mode.");
+  } catch (err) {
+    // A miss is non-destructive. Keep the mode active so the user can click
+    // closer to the intended rule without reopening the tool.
+    try {
+      const stateRes = await api(`/api/${sessionId}/state`);
+      applyState(await stateRes.json(), {
+        resetReplacement: true,
+        refreshImage: false,
+      });
+    } catch (_) {
+      // Keep the original, more useful hit-test error below.
+    }
+    toast(err.message);
+  } finally {
+    tableLineDeletePending = false;
+    syncTableLineDeleteModeUi();
     setBusy(false);
   }
 }
@@ -1073,32 +1330,12 @@ async function selectAt(event) {
     return;
   }
 
-  const rect =
-    pageImage.getBoundingClientRect();
+  if (tableLineDeleteMode) {
+    await deleteTableLineAt(event);
+    return;
+  }
 
-  const renderedX =
-    event.clientX -
-    rect.left;
-
-  const renderedY =
-    event.clientY -
-    rect.top;
-
-  const scaleX =
-    pageImage.naturalWidth /
-    pageImage.clientWidth;
-
-  const scaleY =
-    pageImage.naturalHeight /
-    pageImage.clientHeight;
-
-  const x =
-    (renderedX * scaleX) /
-    zoom;
-
-  const y =
-    (renderedY * scaleY) /
-    zoom;
+  const {x, y} = pdfPointFromImageEvent(event);
 
   try {
     const res =
@@ -1287,11 +1524,16 @@ async function findGlyphElsewhereInPdf() {
         direction: getExpansionDirection(),
       }),
     });
-    applyState(await res.json(), {
+    const data = await res.json();
+    applyState(data, {
       resetReplacement: false,
       refreshImage: false,
     });
-    toast("A verified same-family glyph subset was found inside this PDF.");
+    toast(
+      data.resolution?.fallback_mode === "adaptive_pdf_glyph"
+        ? "Missing PDF glyphs were calibrated to the selected font weight."
+        : "A verified same-family glyph subset was found inside this PDF."
+    );
   } catch (err) {
     toast(err.message);
   } finally {
@@ -1304,9 +1546,9 @@ async function prepareDatabaseFallback(mode) {
 
   if (mode === "closest_font") {
     const accepted = window.confirm(
-      "Complete the original PDF font subset from MongoDB?\n\n" +
-      "For an exact-family Type1C font, only missing glyphs are appended to the original subset. " +
-      "If safe subset completion is not possible, the edit will be rejected; the whole line will not be substituted."
+      "Match missing glyphs to the original PDF font from MongoDB?\n\n" +
+      "An exact face is preferred. If only a compatible lighter face contains the glyph, the tool measures shared glyphs and calibrates the missing outline to the selected font's actual weight. " +
+      "Only missing glyphs are appended to the original Type1C subset. If the measured shape is not compatible, the edit is rejected; the whole line is never substituted."
     );
     if (!accepted) return;
   } else {
@@ -1340,10 +1582,32 @@ async function prepareDatabaseFallback(mode) {
     toast(
       mode === "outline"
         ? "Outline mode is ready. Click Replace as Vector Outline."
-        : `Database glyph donor ready: ${data.font.full_name || data.font.family}.`
+        : data.score?.completion_mode === "adaptive_font"
+        ? `Database glyph weight matched: ${data.font.full_name || data.font.family}.`
+        : `Exact database glyph donor ready: ${data.font.full_name || data.font.family}.`
     );
   } catch (err) {
-    toast(err.message);
+    if (mode === "closest_font") {
+      setText(
+        "matchStatus",
+        "✗ NO SAFE GLYPH MATCH FOUND\n\n" +
+        "The saved database fonts could not supply a glyph whose outline can be safely calibrated to the selected font. The PDF was not changed.\n\n" +
+        "Safe path:\n" +
+        "1. Obtain the licensed full TTF/OTF for the exact face used by this PDF.\n" +
+        "2. Click '1. Upload Exact Font...' and select that file.\n" +
+        "3. Keep the replacement text entered, then run 'Re-check Font Match'.\n" +
+        "4. Replace only after every exact-font check passes.\n\n" +
+        "Required font details:\n" + err.message
+      );
+      setNoticeTone($("matchStatus"), "error");
+      setText(
+        "status",
+        "The PDF was not changed. Upload the exact full font face shown in the red panel, then re-check the match."
+      );
+      toast("Exact full font required. Follow the safe path in the red panel.");
+    } else {
+      toast(err.message);
+    }
   } finally {
     setBusy(false);
   }
@@ -2217,6 +2481,12 @@ $("deletePageBtn")
     deleteCurrentPage
   );
 
+$("deleteTableLineModeBtn")
+  .addEventListener(
+    "click",
+    () => setTableLineDeleteMode(!tableLineDeleteMode)
+  );
+
 $("selectLineBtn")
   .addEventListener(
     "click",
@@ -2227,6 +2497,12 @@ $("deleteLineBtn")
   .addEventListener(
     "click",
     deleteFullLine
+  );
+
+$("addRowBelowBtn")
+  .addEventListener(
+    "click",
+    addFullRowBelow
   );
 
 pageImage.addEventListener(
@@ -2242,6 +2518,15 @@ pageImage.addEventListener(
 window.addEventListener(
   "resize",
   updateSelectionOverlay
+);
+
+document.addEventListener(
+  "keydown",
+  (event) => {
+    if (event.key === "Escape" && tableLineDeleteMode) {
+      setTableLineDeleteMode(false);
+    }
+  }
 );
 
 

@@ -204,7 +204,573 @@ class PdfEngine:
         return overlap / min_height >= 0.65
 
 
-    def full_line_spans(self, all_spans, selected_span: TextSpan):
+    @staticmethod
+    def _drawing_line_cap(value):
+        """Return the single line-cap value accepted by ``Page.draw_line``."""
+        if isinstance(value, (tuple, list)):
+            value = value[0] if value else 0
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def horizontal_table_rules(self, page):
+        """
+        Return horizontal rules that can be edited without touching other art.
+
+        A rule is considered safe only when it is a *single stroked path* made
+        from one horizontal line command.  Redacting that path therefore cannot
+        remove a border, logo, or other drawing that merely shares its content
+        stream.  More complicated paths are intentionally ignored.
+        """
+        if page is None:
+            return []
+
+        try:
+            drawings = page.get_drawings(extended=True)
+        except TypeError:
+            drawings = page.get_drawings()
+        except Exception:
+            return []
+
+        rules = []
+        active_clips = {}
+
+        for drawing_index, drawing in enumerate(drawings or []):
+            drawing_type = str(drawing.get("type") or "")
+            try:
+                level = max(0, int(drawing.get("level") or 0))
+            except (TypeError, ValueError):
+                level = 0
+
+            # Extended drawing output is hierarchical. A new item at a lower
+            # level exits clips from the previous branch.
+            for stale_level in [key for key in active_clips if key >= level]:
+                del active_clips[stale_level]
+
+            if drawing_type == "clip":
+                scissor = drawing.get("scissor")
+                if scissor is not None:
+                    try:
+                        active_clips[level] = pymupdf.Rect(scissor)
+                    except Exception:
+                        pass
+                continue
+
+            # Nested Form XObjects created by the exact text-copy reflow carry
+            # a full source-page display list behind a small clip. Even when a
+            # renderer hides those paths, redacting them can rewrite the whole
+            # form. Only native / top-level paths are safe rule-edit targets.
+            if level > 1:
+                continue
+
+            items = list(drawing.get("items") or [])
+
+            # ``s`` is stroke-only and ``fs`` is fill + stroke. A one-command
+            # fill + stroke path is unusual but still safe when it is a line.
+            if "s" not in drawing_type or len(items) != 1:
+                continue
+
+            item = items[0]
+            if not item or item[0] != "l" or len(item) < 3:
+                continue
+
+            try:
+                p1 = pymupdf.Point(item[1])
+                p2 = pymupdf.Point(item[2])
+                stroke_width = max(0.01, float(drawing.get("width") or 0.0))
+            except Exception:
+                continue
+
+            horizontal_tolerance = max(0.20, stroke_width * 0.35)
+            if abs(float(p1.y) - float(p2.y)) > horizontal_tolerance:
+                continue
+
+            x0 = min(float(p1.x), float(p2.x))
+            x1 = max(float(p1.x), float(p2.x))
+            y = (float(p1.y) + float(p2.y)) / 2.0
+
+            # ``show_pdf_page`` embeds a complete source page behind a tiny
+            # clip. ``get_drawings(extended=True)`` reports the hidden paths as
+            # well. Ignore any path outside, or materially truncated by, its
+            # effective clip so those invisible copies cannot be edited later.
+            if active_clips:
+                effective_clip = None
+                for clip_level, clip_rect in sorted(active_clips.items()):
+                    if clip_level >= level:
+                        continue
+                    if effective_clip is None:
+                        effective_clip = pymupdf.Rect(clip_rect)
+                    else:
+                        effective_clip &= clip_rect
+
+                if effective_clip is not None:
+                    y_pad = max(0.20, stroke_width * 0.75)
+                    if not (
+                        effective_clip.y0 - y_pad
+                        <= y
+                        <= effective_clip.y1 + y_pad
+                    ):
+                        continue
+
+                    visible_x0 = max(x0, float(effective_clip.x0))
+                    visible_x1 = min(x1, float(effective_clip.x1))
+                    if visible_x1 - visible_x0 < (x1 - x0) - 0.50:
+                        continue
+
+            # Tiny strokes are much more likely to be decoration / glyph art
+            # than a table boundary.
+            if x1 - x0 < 24.0:
+                continue
+
+            color = drawing.get("color")
+            if color is None:
+                continue
+
+            try:
+                color = tuple(float(component) for component in color)
+            except Exception:
+                continue
+
+            rules.append(
+                {
+                    "drawing_index": int(drawing_index),
+                    "seqno": int(drawing.get("seqno", -1)),
+                    "x0": x0,
+                    "x1": x1,
+                    "y": y,
+                    "width": stroke_width,
+                    "color": color,
+                    "dashes": drawing.get("dashes"),
+                    "line_cap": self._drawing_line_cap(drawing.get("lineCap")),
+                    "line_join": int(float(drawing.get("lineJoin") or 0)),
+                    "stroke_opacity": float(
+                        drawing.get("stroke_opacity")
+                        if drawing.get("stroke_opacity") is not None
+                        else 1.0
+                    ),
+                }
+            )
+
+        rules.sort(key=lambda rule: (rule["y"], rule["x0"], rule["x1"]))
+        return rules
+
+    def nearest_horizontal_table_rule(self, page, x, y, tolerance=6.0):
+        """Return the nearest safely editable horizontal rule to a PDF point.
+
+        ``horizontal_table_rules()`` deliberately exposes only independently
+        stroked, one-command paths.  Keeping hit testing on top of that filtered
+        list prevents a click from selecting one edge of a rectangle, a logo,
+        or a compound table-border path whose other edges would also disappear.
+        """
+        try:
+            x = float(x)
+            y = float(y)
+            tolerance = float(tolerance)
+        except (TypeError, ValueError):
+            raise ValueError("The table-line position must use PDF coordinates.")
+
+        if not all(math.isfinite(value) for value in (x, y, tolerance)):
+            raise ValueError("The table-line position must use finite PDF coordinates.")
+
+        # Six PDF points is a forgiving browser-click target around a hairline
+        # while remaining local enough for closely spaced double rules.
+        tolerance = min(6.0, max(1.0, tolerance))
+        candidates = []
+
+        for rule in self.horizontal_table_rules(page):
+            x0 = float(rule["x0"])
+            x1 = float(rule["x1"])
+            rule_y = float(rule["y"])
+            stroke_width = max(0.01, float(rule.get("width") or 0.0))
+            vertical_distance = abs(y - rule_y)
+            vertical_tolerance = max(tolerance, stroke_width / 2.0 + 2.0)
+
+            if x < x0:
+                horizontal_distance = x0 - x
+            elif x > x1:
+                horizontal_distance = x - x1
+            else:
+                horizontal_distance = 0.0
+
+            if (
+                vertical_distance > vertical_tolerance
+                or horizontal_distance > tolerance
+            ):
+                continue
+
+            distance = math.hypot(horizontal_distance, vertical_distance)
+            candidate = dict(rule)
+            candidate["hit_distance"] = float(distance)
+            candidates.append(
+                (
+                    float(distance),
+                    float(vertical_distance),
+                    float(horizontal_distance),
+                    -float(x1 - x0),
+                    candidate,
+                )
+            )
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[:-1])
+
+        # Do not make an arbitrary destructive choice halfway between two
+        # neighbouring rules. The UI can ask the user to click closer to one.
+        if len(candidates) > 1:
+            first = candidates[0]
+            second = candidates[1]
+            if (
+                abs(float(first[0]) - float(second[0])) <= 0.25
+                and abs(float(first[1]) - float(second[1])) <= 0.25
+            ):
+                raise ValueError(
+                    "More than one horizontal table line is equally close. "
+                    "Click closer to the line you want to remove."
+                )
+
+        return candidates[0][-1]
+
+    @staticmethod
+    def _horizontal_rule_redaction_rect(rule, bounds, vertical_pad=None):
+        """Build a rectangle that fully covers one stroked rule path."""
+        stroke_width = max(0.01, float(rule.get("width") or 0.0))
+        endpoint_pad = max(0.35, stroke_width * 1.5)
+        if vertical_pad is None:
+            vertical_pad = max(0.35, stroke_width * 1.5)
+        else:
+            vertical_pad = max(0.05, float(vertical_pad))
+        rect = pymupdf.Rect(
+            float(rule["x0"]) - endpoint_pad,
+            float(rule["y"]) - vertical_pad,
+            float(rule["x1"]) + endpoint_pad,
+            float(rule["y"]) + vertical_pad,
+        ) & pymupdf.Rect(bounds)
+        rect.normalize()
+        return rect
+
+    @staticmethod
+    def _same_horizontal_rule_geometry(observed, expected):
+        # Serialization retains path coordinates far more accurately than a
+        # quarter point. Keep this tighter than a normal double-rule gap so a
+        # surviving neighbour cannot masquerade as the deleted target.
+        tolerance = max(
+            0.08,
+            min(0.25, float(expected.get("width") or 0.0) * 0.50),
+        )
+        return (
+            abs(float(observed["y"]) - float(expected["y"])) <= tolerance
+            and abs(float(observed["x0"]) - float(expected["x0"])) <= 0.75
+            and abs(float(observed["x1"]) - float(expected["x1"])) <= 0.75
+        )
+
+    @classmethod
+    def _same_horizontal_rule_signature(cls, observed, expected):
+        """Compare geometry and stroke style for an untouched neighbour."""
+        if not cls._same_horizontal_rule_geometry(observed, expected):
+            return False
+
+        expected_color = tuple(float(value) for value in (expected.get("color") or ()))
+        observed_color = tuple(float(value) for value in (observed.get("color") or ()))
+        if len(expected_color) != len(observed_color):
+            return False
+        if any(
+            abs(left - right) > 0.0005
+            for left, right in zip(expected_color, observed_color)
+        ):
+            return False
+
+        return (
+            abs(
+                float(observed.get("width") or 0.0)
+                - float(expected.get("width") or 0.0)
+            ) <= 0.005
+            and str(observed.get("dashes") or "")
+            == str(expected.get("dashes") or "")
+            and int(observed.get("line_cap") or 0)
+            == int(expected.get("line_cap") or 0)
+            and int(observed.get("line_join") or 0)
+            == int(expected.get("line_join") or 0)
+            and abs(
+                float(observed.get("stroke_opacity", 1.0))
+                - float(expected.get("stroke_opacity", 1.0))
+            ) <= 0.0005
+        )
+
+    def delete_horizontal_table_rule_at(self, page, x, y, tolerance=6.0):
+        """Delete one standalone horizontal table rule selected by PDF point.
+
+        The operation removes graphics only: text and images are explicitly
+        excluded from the redaction.  A rule is eligible only when
+        :meth:`horizontal_table_rules` proves it is an independently stroked,
+        single-command path.  The edited document is then serialized and
+        reopened before success is reported.
+        """
+        if page is None:
+            raise ValueError("The PDF page is no longer available.")
+
+        doc = page.parent
+        if doc is None:
+            raise ValueError("The edited page is no longer attached to a PDF.")
+
+        rule = self.nearest_horizontal_table_rule(
+            page,
+            x,
+            y,
+            tolerance=tolerance,
+        )
+        if rule is None:
+            try:
+                shown_tolerance = min(6.0, max(1.0, float(tolerance)))
+            except (TypeError, ValueError):
+                shown_tolerance = 6.0
+            raise ValueError(
+                "No independently stroked horizontal table line was found "
+                f"within {shown_tolerance:.1f} PDF points of that position."
+            )
+
+        page_number = int(page.number)
+        rules_before = self.horizontal_table_rules(page)
+        target_index = int(rule.get("drawing_index", -1))
+        other_rules = [
+            item
+            for item in rules_before
+            if int(item.get("drawing_index", -1)) != target_index
+        ]
+
+        # Keep the graphics-only redaction band strictly inside the midpoint to
+        # the nearest overlapping horizontal rule. If the target stroke itself
+        # cannot fit in that isolated band, refusing is safer than erasing both.
+        overlapping_rule_gaps = []
+        for other in other_rules:
+            horizontal_overlap = max(
+                0.0,
+                min(float(rule["x1"]), float(other["x1"]))
+                - max(float(rule["x0"]), float(other["x0"])),
+            )
+            if horizontal_overlap <= 0.0:
+                continue
+            overlapping_rule_gaps.append(
+                abs(float(other["y"]) - float(rule["y"]))
+            )
+
+        stroke_width = max(0.01, float(rule.get("width") or 0.0))
+        required_vertical_pad = max(0.10, stroke_width / 2.0 + 0.05)
+        preferred_vertical_pad = max(0.35, stroke_width * 1.5)
+        vertical_pad = preferred_vertical_pad
+        if overlapping_rule_gaps:
+            nearest_gap = min(overlapping_rule_gaps)
+            maximum_isolated_pad = nearest_gap / 2.0 - 0.05
+            if maximum_isolated_pad < required_vertical_pad:
+                raise ValueError(
+                    "This table line is too close to another horizontal rule "
+                    "to remove either one safely."
+                )
+            vertical_pad = min(vertical_pad, maximum_isolated_pad)
+
+        redaction_rect = self._horizontal_rule_redaction_rect(
+            rule,
+            page.rect,
+            vertical_pad=vertical_pad,
+        )
+        if redaction_rect.is_empty:
+            raise ValueError("The selected table line is outside the PDF page.")
+
+        try:
+            drawings = page.get_drawings(extended=True)
+        except TypeError:
+            drawings = page.get_drawings()
+
+        # COVERED is safer than TOUCHED, but it would still remove a second tiny
+        # path wholly enclosed by the same narrow strip. Refuse that ambiguous
+        # case instead of changing unrelated artwork.
+        for drawing_index, drawing in enumerate(drawings or []):
+            if drawing_index == target_index:
+                continue
+            drawing_type = str(drawing.get("type") or "")
+            try:
+                drawing_level = max(0, int(drawing.get("level") or 0))
+            except (TypeError, ValueError):
+                drawing_level = 0
+            if drawing_level > 1:
+                continue
+            if drawing_type in {"clip", "group"}:
+                continue
+            if not (
+                "s" in drawing_type
+                or "f" in drawing_type
+            ):
+                continue
+            try:
+                drawing_rect = pymupdf.Rect(drawing.get("rect"))
+                drawing_rect.normalize()
+            except Exception:
+                continue
+            if drawing_rect.is_empty:
+                continue
+            fully_covered = (
+                float(drawing_rect.x0) >= float(redaction_rect.x0)
+                and float(drawing_rect.y0) >= float(redaction_rect.y0)
+                and float(drawing_rect.x1) <= float(redaction_rect.x1)
+                and float(drawing_rect.y1) <= float(redaction_rect.y1)
+            )
+            if fully_covered:
+                raise ValueError(
+                    "This table line overlaps another independent graphic, so "
+                    "it cannot be removed without risking that artwork."
+                )
+
+        text_before = page.get_text("text")
+        words_before = [
+            (
+                round(float(word[0]), 3),
+                round(float(word[1]), 3),
+                round(float(word[2]), 3),
+                round(float(word[3]), 3),
+                str(word[4]),
+            )
+            for word in page.get_text("words")
+            if len(word) >= 5
+        ]
+        page.add_redact_annot(
+            redaction_rect,
+            fill=None,
+            cross_out=False,
+        )
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+            text=pymupdf.PDF_REDACT_TEXT_NONE,
+        )
+
+        # Validate the actual serialized form, not merely MuPDF's current
+        # in-memory display list.
+        try:
+            check_raw = doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+            )
+        except TypeError:
+            check_raw = doc.tobytes(no_new_id=True)
+
+        probe = pymupdf.open(stream=check_raw, filetype="pdf")
+        try:
+            check_page = probe[page_number]
+            check_rules = self.horizontal_table_rules(check_page)
+
+            if any(
+                self._same_horizontal_rule_geometry(item, rule)
+                for item in check_rules
+            ):
+                raise ValueError(
+                    "Table-line deletion failed: the selected rule remains in "
+                    "the serialized PDF."
+                )
+
+            for expected in other_rules:
+                if not any(
+                    self._same_horizontal_rule_signature(item, expected)
+                    for item in check_rules
+                ):
+                    raise ValueError(
+                        "Table-line deletion cancelled: an unrelated horizontal "
+                        "rule changed during the operation."
+                    )
+
+            text_after = check_page.get_text("text")
+            words_after = [
+                (
+                    round(float(word[0]), 3),
+                    round(float(word[1]), 3),
+                    round(float(word[2]), 3),
+                    round(float(word[3]), 3),
+                    str(word[4]),
+                )
+                for word in check_page.get_text("words")
+                if len(word) >= 5
+            ]
+            if text_after != text_before or words_after != words_before:
+                raise ValueError(
+                    "Table-line deletion cancelled: searchable page text changed "
+                    "during the graphics-only operation."
+                )
+        finally:
+            probe.close()
+
+        visible_half_width = max(0.005, stroke_width / 2.0)
+        bbox = [
+            float(rule["x0"]),
+            float(rule["y"]) - visible_half_width,
+            float(rule["x1"]),
+            float(rule["y"]) + visible_half_width,
+        ]
+        public_rule = {
+            "x0": float(rule["x0"]),
+            "x1": float(rule["x1"]),
+            "y": float(rule["y"]),
+            "width": stroke_width,
+            "color": [float(value) for value in (rule.get("color") or ())],
+            "dashes": rule.get("dashes"),
+            "line_cap": int(rule.get("line_cap") or 0),
+            "line_join": int(rule.get("line_join") or 0),
+            "stroke_opacity": float(
+                rule.get("stroke_opacity")
+                if rule.get("stroke_opacity") is not None
+                else 1.0
+            ),
+            "bbox": list(bbox),
+        }
+
+        return {
+            "deleted": True,
+            "page_index": page_number,
+            "page_number": page_number + 1,
+            "click": [float(x), float(y)],
+            "hit_distance": float(rule.get("hit_distance") or 0.0),
+            "bbox": bbox,
+            "redaction_bbox": [float(value) for value in redaction_rect],
+            "rule": public_rule,
+            "immediate_validation_passed": True,
+        }
+
+    @staticmethod
+    def _rule_spans_band(rule, x0, x1, minimum_ratio=0.78):
+        band_width = max(1.0, float(x1) - float(x0))
+        overlap = max(
+            0.0,
+            min(float(rule["x1"]), float(x1))
+            - max(float(rule["x0"]), float(x0)),
+        )
+        # Measure against the requested row band, not the shorter object. A
+        # small decorative stroke wholly inside a wide table row must never be
+        # accepted merely because 100% of that tiny stroke overlaps the row.
+        return overlap / band_width >= float(minimum_ratio)
+
+    @staticmethod
+    def _has_table_column_layout(spans):
+        ordered = sorted(
+            list(spans or []),
+            key=lambda span: (float(span.bbox[0]), float(span.bbox[1])),
+        )
+        if len(ordered) < 2:
+            return False
+
+        typical_size = max(
+            1.0,
+            float(median([float(span.size) for span in ordered])),
+        )
+        column_gap = max(24.0, typical_size * 3.0)
+
+        return any(
+            float(current.bbox[0]) - float(previous.bbox[2]) > column_gap
+            for previous, current in zip(ordered, ordered[1:])
+        )
+
+    def full_line_spans(self, all_spans, selected_span: TextSpan, page=None):
         """
         Return every extracted span that visually belongs to the selected line.
 
@@ -289,6 +855,45 @@ class PdfEngine:
                         result.append(span)
                         changed = True
                         break
+
+        # A tabular row is commonly stored as several independent visual lines
+        # because its cells have large horizontal gaps.  Expand the selection
+        # across those cells only when a safe, long horizontal rule proves that
+        # they belong to one table row. This retains the conservative column
+        # splitting used for ordinary multi-column documents.
+        if page is not None:
+            baseline_tolerance = max(1.25, float(selected_span.size) * 0.34)
+            row_candidates = [
+                span
+                for span in spans
+                if abs(
+                    float(span.origin[1]) - float(selected_span.origin[1])
+                ) <= baseline_tolerance
+            ]
+
+            if (
+                len(row_candidates) > len(result)
+                and self._has_table_column_layout(row_candidates)
+            ):
+                row_bbox = self.line_bbox(row_candidates)
+                row_size = max(float(span.size) for span in row_candidates)
+                max_rule_distance = max(18.0, row_size * 3.0)
+                matching_rule = any(
+                    self._rule_spans_band(
+                        rule,
+                        float(row_bbox[0]),
+                        float(row_bbox[2]),
+                        minimum_ratio=0.84,
+                    )
+                    and min(
+                        abs(float(rule["y"]) - float(row_bbox[1])),
+                        abs(float(rule["y"]) - float(row_bbox[3])),
+                    ) <= max_rule_distance
+                    for rule in self.horizontal_table_rules(page)
+                )
+
+                if matching_rule:
+                    result = row_candidates
 
         result.sort(
             key=lambda span: (
@@ -471,7 +1076,13 @@ class PdfEngine:
         return replacements
 
 
-    def plan_delete_line_reflow(self, all_spans, selected_line_spans, page_rect=None):
+    def plan_delete_line_reflow(
+        self,
+        all_spans,
+        selected_line_spans,
+        page_rect=None,
+        page=None,
+    ):
         """
         Build a Word-like upward-flow plan after deleting one visual line.
 
@@ -549,6 +1160,124 @@ class PdfEngine:
 
         flow_lines = [line for line in later_lines if same_flow_column(line)]
 
+        # A table row must never pull a fixed footer / later unrelated section
+        # into the reflow merely because that content overlaps the table's wide
+        # horizontal band.  This was also the main performance trap in the web
+        # editor: each unrelated footer line became another clipped full-page
+        # Form XObject, so rebuilding the selectable-text dictionary could take
+        # minutes on a small VPS.
+        #
+        # When the selected line has a proven multi-column layout, use the
+        # table's own independently stroked horizontal rules as a structural
+        # boundary.  Only the contiguous rule cluster around the selected row
+        # is considered; a second table farther down the page is not joined to
+        # it.  One normal row of padding after the last rule keeps an unruled
+        # total row (a common bank-statement layout) in the same reflow.
+        table_row_step = None
+        if page is not None and self._has_table_column_layout(selected):
+            selected_width = max(1.0, selected_x1 - selected_x0)
+            matching_rules = [
+                dict(rule)
+                for rule in self.horizontal_table_rules(page)
+                if float(rule["x1"]) - float(rule["x0"])
+                >= max(48.0, selected_width * 0.72)
+                and self._rule_spans_band(
+                    rule,
+                    selected_x0,
+                    selected_x1,
+                    minimum_ratio=0.82,
+                )
+            ]
+            matching_rules.sort(key=lambda rule: float(rule["y"]))
+
+            if matching_rules:
+                selected_mid_y = (
+                    float(selected_bbox[1]) + float(selected_bbox[3])
+                ) / 2.0
+                anchor_index = min(
+                    range(len(matching_rules)),
+                    key=lambda index: abs(
+                        float(matching_rules[index]["y"]) - selected_mid_y
+                    ),
+                )
+                anchor_distance = abs(
+                    float(matching_rules[anchor_index]["y"])
+                    - selected_mid_y
+                )
+                cluster_gap_limit = max(72.0, selected_size * 6.0)
+                row_rule_distance = max(24.0, selected_size * 3.25)
+
+                if anchor_distance <= row_rule_distance:
+                    start = anchor_index
+                    while start > 0:
+                        gap = (
+                            float(matching_rules[start]["y"])
+                            - float(matching_rules[start - 1]["y"])
+                        )
+                        if gap > cluster_gap_limit:
+                            break
+                        start -= 1
+
+                    end = anchor_index
+                    while end + 1 < len(matching_rules):
+                        gap = (
+                            float(matching_rules[end + 1]["y"])
+                            - float(matching_rules[end]["y"])
+                        )
+                        if gap > cluster_gap_limit:
+                            break
+                        end += 1
+
+                    rule_cluster = matching_rules[start : end + 1]
+                    rule_ys = [float(rule["y"]) for rule in rule_cluster]
+                    rule_steps = [
+                        later - earlier
+                        for earlier, later in zip(rule_ys, rule_ys[1:])
+                        if 1.0 <= later - earlier <= cluster_gap_limit
+                    ]
+
+                    nearby_table_baselines = sorted(
+                        {
+                            float(line["baseline"])
+                            for line in flow_lines
+                            if float(line["baseline"])
+                            <= max(rule_ys) + cluster_gap_limit
+                        }
+                    )
+                    baseline_steps = [
+                        later - earlier
+                        for earlier, later in zip(
+                            [float(selected_baseline)] + nearby_table_baselines,
+                            nearby_table_baselines,
+                        )
+                        if 1.0 <= later - earlier <= cluster_gap_limit
+                    ]
+                    normal_table_step = float(
+                        median(rule_steps or baseline_steps)
+                        if (rule_steps or baseline_steps)
+                        else max(selected_height, selected_size * 1.2)
+                    )
+                    # A proven table's separator spacing is the authoritative
+                    # row height.  Do not later replace it with the median
+                    # baseline spacing from the whole page: compact body text,
+                    # footers, or another table can have a smaller leading.
+                    # Repeated row deletes otherwise under-shift each remaining
+                    # row and accumulate a visible blank gap.
+                    if rule_steps:
+                        table_row_step = float(median(rule_steps))
+                    elif baseline_steps:
+                        table_row_step = float(median(baseline_steps))
+                    table_bottom = max(rule_ys) + max(
+                        normal_table_step * 1.35,
+                        selected_height * 1.5,
+                        selected_size * 2.0,
+                    )
+                    flow_lines = [
+                        line
+                        for line in flow_lines
+                        if float(line["bbox"][1]) <= table_bottom
+                    ]
+
         if page_rect is not None:
             try:
                 page_bottom = float(page_rect.y1)
@@ -602,7 +1331,12 @@ class PdfEngine:
             if 0.75 <= d <= max(24.0, selected_size * 2.25):
                 candidate_steps.append(d)
 
-        if candidate_steps:
+        if table_row_step is not None and table_row_step >= max(
+            1.0,
+            selected_height * 0.70,
+        ):
+            normal_step = float(table_row_step)
+        elif candidate_steps:
             normal_step = float(median(candidate_steps))
         else:
             normal_step = max(
@@ -717,8 +1451,936 @@ class PdfEngine:
             ),
         }
 
+    def plan_table_rule_reflow(
+        self,
+        page,
+        selected_line_spans,
+        shifted_items,
+        shift_dy,
+        remove_deleted_row_rule=False,
+    ):
+        """
+        Plan safe vector-rule changes for a table-row deletion.
 
-    def delete_full_line_with_reflow(self, page, line_spans, shifted_items):
+        Only independently stroked, single-command horizontal paths are ever
+        included. Rules spanning the selected row and the affected vertical
+        content range move by the same delta as the text. When explicitly
+        requested, the first separator belonging to the deleted row is removed
+        instead of moved.
+        """
+        selected = list(selected_line_spans or [])
+        shifted = list(shifted_items or [])
+
+        if not selected:
+            raise ValueError("No full line is selected.")
+
+        selected_bbox = self.line_bbox(selected)
+        if not selected_bbox:
+            return {
+                "actions": [],
+                "moved_count": 0,
+                "removed_count": 0,
+                "detected_count": 0,
+            }
+
+        # A long divider under an ordinary paragraph is not sufficient table
+        # evidence. Require multiple selected cells with at least one genuine
+        # column-sized gap. It is safer to leave an unusual one-cell table rule
+        # untouched than to reposition unrelated page artwork.
+        if not self._has_table_column_layout(selected):
+            return {
+                "actions": [],
+                "moved_count": 0,
+                "removed_count": 0,
+                "detected_count": 0,
+            }
+
+        shift_dy = float(shift_dy or 0.0)
+        selected_x0 = float(selected_bbox[0])
+        selected_x1 = float(selected_bbox[2])
+        selected_y1 = float(selected_bbox[3])
+        selected_width = max(1.0, selected_x1 - selected_x0)
+        selected_size = max(float(span.size) for span in selected)
+
+        original_shifted_rects = []
+        for item in shifted:
+            span = item.get("span")
+            if span is None:
+                continue
+            try:
+                original_shifted_rects.append(
+                    pymupdf.Rect(*(float(value) for value in span.bbox))
+                )
+            except Exception:
+                continue
+
+        if original_shifted_rects:
+            first_shifted_y0 = min(rect.y0 for rect in original_shifted_rects)
+            last_shifted_y1 = max(rect.y1 for rect in original_shifted_rects)
+            vertical_padding = max(
+                8.0,
+                abs(shift_dy) * 1.25,
+                selected_size * 1.5,
+            )
+            maximum_rule_y = last_shifted_y1 + vertical_padding
+        else:
+            first_shifted_y0 = None
+            maximum_rule_y = selected_y1 + max(18.0, selected_size * 3.0)
+
+        candidates = []
+        for rule in self.horizontal_table_rules(page):
+            rule_width = float(rule["x1"]) - float(rule["x0"])
+            if rule_width < max(48.0, selected_width * 0.72):
+                continue
+            if not self._rule_spans_band(
+                rule,
+                selected_x0,
+                selected_x1,
+                minimum_ratio=0.82,
+            ):
+                continue
+            if float(rule["y"]) < selected_y1 - max(0.75, rule["width"]):
+                continue
+            if float(rule["y"]) > maximum_rule_y:
+                continue
+            candidates.append(dict(rule))
+
+        candidates.sort(key=lambda rule: (rule["y"], rule["x0"]))
+
+        # The removable separator must be the nearest rule immediately after
+        # the deleted row. With later text, require it to sit before that next
+        # row; this avoids deleting a boundary that actually belongs below it.
+        removable_index = None
+        if remove_deleted_row_rule and candidates:
+            first_rule = candidates[0]
+            distance = float(first_rule["y"]) - selected_y1
+            close_enough = distance <= max(18.0, selected_size * 2.5)
+            before_next_row = (
+                first_shifted_y0 is None
+                or float(first_rule["y"])
+                <= float(first_shifted_y0) + max(1.0, first_rule["width"] * 2.0)
+            )
+            if distance >= -max(0.75, first_rule["width"]) and close_enough and before_next_row:
+                removable_index = 0
+
+        actions = []
+
+        for index, rule in enumerate(candidates):
+            if index == removable_index:
+                action_name = "remove"
+                target_y = None
+            elif abs(shift_dy) >= 0.01:
+                action_name = "move"
+                target_y = float(rule["y"]) + shift_dy
+            else:
+                continue
+
+            actions.append(
+                {
+                    **rule,
+                    "action": action_name,
+                    "target_y": target_y,
+                }
+            )
+
+        return {
+            "actions": actions,
+            "moved_count": sum(
+                1 for action in actions if action["action"] == "move"
+            ),
+            "removed_count": sum(
+                1 for action in actions if action["action"] == "remove"
+            ),
+            "detected_count": len(candidates),
+        }
+
+    @staticmethod
+    def _table_cell_groups(spans):
+        """Group one selected table row into visual cells.
+
+        A PDF has no native concept of a table cell.  We therefore keep spans
+        that are separated by normal word spacing together and split only on
+        a genuine column-sized gap.  The returned groups are also the exact
+        clips used when cloning a row, so a row may contain two, five, or any
+        other number of columns without a fixed schema.
+        """
+        ordered = sorted(
+            list(spans or []),
+            key=lambda span: (
+                float(span.bbox[0]),
+                float(span.bbox[1]),
+                int(span.block_index),
+                int(span.line_index),
+                int(span.span_index),
+            ),
+        )
+        if not ordered:
+            return []
+
+        sizes = [max(1.0, float(span.size)) for span in ordered]
+        split_gap = max(24.0, float(median(sizes)) * 3.0)
+        groups = [[ordered[0]]]
+
+        for span in ordered[1:]:
+            previous = groups[-1][-1]
+            gap = float(span.bbox[0]) - float(previous.bbox[2])
+            if gap > split_gap:
+                groups.append([span])
+            else:
+                groups[-1].append(span)
+
+        return groups
+
+    def plan_insert_table_row(
+        self,
+        page,
+        all_spans,
+        selected_line_spans,
+        position="below",
+    ):
+        """Plan a template-clone table-row insertion.
+
+        The selected row supplies the exact existing PDF glyphs, font
+        resources, cell positions, and separator style.  Later page content is
+        moved down by one proven row step.  This is deliberately limited to a
+        row whose multi-column layout and horizontal separator can both be
+        established safely; guessing on ordinary paragraph text would risk
+        moving unrelated page artwork.
+        """
+        if str(position or "below").lower() != "below":
+            raise ValueError("Only insertion below the selected table row is supported.")
+
+        selected = list(selected_line_spans or [])
+        if not selected:
+            raise ValueError("Select a full table row before adding a row.")
+        if not self._has_table_column_layout(selected):
+            raise ValueError(
+                "The selected line is not a proven multi-column table row. "
+                "Select a row containing at least two separated columns."
+            )
+
+        cell_groups = self._table_cell_groups(selected)
+        if len(cell_groups) < 2:
+            raise ValueError(
+                "At least two table columns are required before a row can be cloned."
+            )
+
+        selected_bbox = self.line_bbox(selected)
+        if not selected_bbox:
+            raise ValueError("The selected table row has no usable PDF bounds.")
+
+        selected_baseline = float(
+            median([float(span.origin[1]) for span in selected])
+        )
+        selected_size = max(float(span.size) for span in selected)
+        selected_height = max(
+            1.0,
+            float(selected_bbox[3]) - float(selected_bbox[1]),
+        )
+        selected_x0 = float(selected_bbox[0])
+        selected_x1 = float(selected_bbox[2])
+
+        # Only independently stroked rules spanning nearly the whole selected
+        # row may be copied or moved.
+        matching_rules = []
+        for rule in self.horizontal_table_rules(page):
+            if not self._rule_spans_band(
+                rule,
+                selected_x0,
+                selected_x1,
+                minimum_ratio=0.82,
+            ):
+                continue
+            if float(rule["x1"]) - float(rule["x0"]) < max(
+                48.0,
+                (selected_x1 - selected_x0) * 0.72,
+            ):
+                continue
+            matching_rules.append(dict(rule))
+
+        matching_rules.sort(key=lambda rule: (float(rule["y"]), float(rule["x0"])))
+        separator_candidates = [
+            rule
+            for rule in matching_rules
+            if float(rule["y"])
+            >= float(selected_bbox[3]) - max(0.75, float(rule.get("width") or 0.0))
+            and float(rule["y"])
+            <= float(selected_bbox[3]) + max(24.0, selected_size * 3.0)
+        ]
+        if not separator_candidates:
+            raise ValueError(
+                "A safe horizontal separator below the selected table row "
+                "could not be found. The row was not changed."
+            )
+        separator = min(separator_candidates, key=lambda rule: float(rule["y"]))
+
+        # Derive row height from the table's own geometry.  Separator spacing
+        # is strongest evidence; adjacent row baselines are the fallback.
+        rule_step_candidates = []
+        separator_y = float(separator["y"])
+        rule_ys = [float(rule["y"]) for rule in matching_rules]
+        later_rule_ys = [value for value in rule_ys if value > separator_y + 0.25]
+        earlier_rule_ys = [value for value in rule_ys if value < separator_y - 0.25]
+        # The nearest rule above and the selected row's bottom separator bound
+        # this exact row, so that distance has priority when it exists.
+        if earlier_rule_ys:
+            rule_step_candidates.append(separator_y - max(earlier_rule_ys))
+        if later_rule_ys:
+            rule_step_candidates.append(min(later_rule_ys) - separator_y)
+
+        visual_lines = self._group_visual_lines(all_spans)
+        later_baselines = sorted(
+            {
+                round(float(line["baseline"]), 4)
+                for line in visual_lines
+                if float(line["baseline"]) > selected_baseline + 0.25
+                and max(
+                    0.0,
+                    min(float(line["bbox"][2]), selected_x1)
+                    - max(float(line["bbox"][0]), selected_x0),
+                )
+                > 0.0
+            }
+        )
+        baseline_step_candidates = []
+        if later_baselines:
+            baseline_step_candidates.append(
+                float(later_baselines[0]) - selected_baseline
+            )
+
+        plausible_rule_steps = [
+            float(value)
+            for value in rule_step_candidates
+            if max(1.0, selected_height * 0.70)
+            <= float(value)
+            <= max(72.0, selected_size * 6.0)
+        ]
+        plausible_baseline_steps = [
+            float(value)
+            for value in baseline_step_candidates
+            if max(1.0, selected_height * 0.70)
+            <= float(value)
+            <= max(72.0, selected_size * 6.0)
+        ]
+        if not plausible_rule_steps and not plausible_baseline_steps:
+            raise ValueError(
+                "The table row height could not be established safely from "
+                "its neighboring rows or separators."
+            )
+
+        # Rule geometry is authoritative.  The closest plausible rule spacing
+        # represents the current data-row slot and avoids adopting a larger
+        # total/section gap below the table. Baselines are used only when the
+        # table has no second safe separator.
+        shift_dy = float(
+            min(plausible_rule_steps)
+            if plausible_rule_steps
+            else min(plausible_baseline_steps)
+        )
+        if shift_dy < 0.5:
+            raise ValueError("The detected table row height is too small to insert safely.")
+
+        # Reuse the conservative text-flow selection from line deletion, but
+        # reverse its direction and use the table-proven row height.
+        flow_plan = self.plan_delete_line_reflow(
+            all_spans,
+            selected,
+            page.rect,
+            page=page,
+        )
+        shifted_items = []
+        for item in flow_plan.get("shifted_items", []) or []:
+            span = item.get("span")
+            if span is None:
+                continue
+            shifted_items.append(
+                {
+                    **dict(item),
+                    "text": span.text,
+                    "origin": (
+                        float(span.origin[0]),
+                        float(span.origin[1]) + shift_dy,
+                    ),
+                    "final_bbox": (
+                        float(span.bbox[0]),
+                        float(span.bbox[1]) + shift_dy,
+                        float(span.bbox[2]),
+                        float(span.bbox[3]) + shift_dy,
+                    ),
+                    "renumbered": False,
+                }
+            )
+
+        inserted_bbox = (
+            float(selected_bbox[0]),
+            float(selected_bbox[1]) + shift_dy,
+            float(selected_bbox[2]),
+            float(selected_bbox[3]) + shift_dy,
+        )
+
+        # Moving the table down may collide with the paragraph immediately
+        # following it even when that paragraph is outside the table's rule
+        # cluster. Propagate the same row-height shift through only the
+        # contiguous, physically colliding text below the table. The first
+        # non-overlapping line ends the cascade, so a later section / footer is
+        # left at its original coordinates whenever the existing whitespace is
+        # sufficient. This preserves the original gaps inside a multi-line
+        # paragraph and prevents the inserted row from painting over it.
+        selected_ids = {id(span) for span in selected}
+        shifted_ids = {
+            id(item["span"])
+            for item in shifted_items
+            if item.get("span") is not None
+        }
+        affected_x0 = min(
+            [float(inserted_bbox[0])]
+            + [float(item["final_bbox"][0]) for item in shifted_items]
+        )
+        affected_x1 = max(
+            [float(inserted_bbox[2])]
+            + [float(item["final_bbox"][2]) for item in shifted_items]
+        )
+        cascade_bottom = max(
+            [float(inserted_bbox[3])]
+            + [float(item["final_bbox"][3]) for item in shifted_items]
+        )
+
+        for line in visual_lines:
+            if float(line["baseline"]) <= selected_baseline + 0.25:
+                continue
+
+            remaining = [
+                span
+                for span in line["spans"]
+                if id(span) not in selected_ids and id(span) not in shifted_ids
+            ]
+            if not remaining:
+                continue
+
+            line_bbox = self.line_bbox(remaining)
+            if not line_bbox:
+                continue
+
+            horizontal_overlap = max(
+                0.0,
+                min(float(line_bbox[2]), affected_x1)
+                - max(float(line_bbox[0]), affected_x0),
+            )
+            if horizontal_overlap <= 0.0:
+                continue
+
+            # Once a line in the affected horizontal flow starts below the
+            # shifted content, every later line starts lower still and cannot
+            # collide with this insertion.
+            if float(line_bbox[1]) >= cascade_bottom - 0.10:
+                break
+
+            for span in remaining:
+                shifted_items.append(
+                    {
+                        "span": span,
+                        "text": span.text,
+                        "origin": (
+                            float(span.origin[0]),
+                            float(span.origin[1]) + shift_dy,
+                        ),
+                        "final_bbox": (
+                            float(span.bbox[0]),
+                            float(span.bbox[1]) + shift_dy,
+                            float(span.bbox[2]),
+                            float(span.bbox[3]) + shift_dy,
+                        ),
+                        "renumbered": False,
+                        "line_key": line["key"],
+                    }
+                )
+                shifted_ids.add(id(span))
+
+            cascade_bottom = max(
+                cascade_bottom,
+                float(line_bbox[3]) + shift_dy,
+            )
+
+        # Never create a row or move body content into the fixed footer band.
+        footer_limit = float(page.rect.y1) * 0.94
+        target_bottoms = [float(inserted_bbox[3])]
+        target_bottoms.extend(float(item["final_bbox"][3]) for item in shifted_items)
+        if target_bottoms and max(target_bottoms) >= footer_limit:
+            raise ValueError(
+                "There is not enough room below this table row. Adding it "
+                "would move content into the page footer or off the page."
+            )
+
+        original_shifted_bottom = max(
+            [float(item["span"].bbox[3]) for item in shifted_items]
+            or [float(selected_bbox[3])]
+        )
+        maximum_rule_y = original_shifted_bottom + max(
+            8.0,
+            shift_dy * 0.75,
+            selected_size * 1.5,
+        )
+
+        rule_actions = []
+        for rule in matching_rules:
+            rule_y = float(rule["y"])
+            if rule_y <= separator_y + max(0.20, float(rule.get("width") or 0.0)):
+                continue
+            if rule_y > maximum_rule_y:
+                continue
+            rule_actions.append(
+                {
+                    **dict(rule),
+                    "action": "move",
+                    "target_y": rule_y + shift_dy,
+                }
+            )
+
+        inserted_rule = {
+            **dict(separator),
+            "action": "insert",
+            "source_y": separator_y,
+            "target_y": separator_y + shift_dy,
+        }
+        table_rule_plan = {
+            "actions": rule_actions,
+            "insertions": [inserted_rule],
+            "moved_count": len(rule_actions),
+            "inserted_count": 1,
+            "detected_count": len(matching_rules),
+        }
+
+        template_cells = []
+        for group in cell_groups:
+            bbox = self.line_bbox(group)
+            template_cells.append(
+                {
+                    "text": self._line_text(group),
+                    "bbox": tuple(float(value) for value in bbox),
+                }
+            )
+
+        return {
+            "ok": True,
+            "position": "below",
+            "column_count": len(template_cells),
+            "shift_dy": shift_dy,
+            "shifted_items": shifted_items,
+            "table_rule_plan": table_rule_plan,
+            "template_bbox": tuple(float(value) for value in selected_bbox),
+            "template_text": self._line_text(selected),
+            "template_cells": template_cells,
+            "inserted_bbox": inserted_bbox,
+            "reason": (
+                f"Detected {len(template_cells)} table column(s) and a "
+                f"{shift_dy:.2f} pt row step."
+            ),
+        }
+
+    def insert_table_row_with_reflow(self, page, line_spans, plan):
+        """Clone a selected table row and move later content down exactly.
+
+        Existing PDF content is copied from an in-memory pre-edit snapshot via
+        ``show_pdf_page``.  No font is substituted or synthesized, so the cloned
+        row retains the template row's searchable text, glyph shapes, weight,
+        spacing, and resource identity.  The caller may then edit each cloned
+        cell through the normal clean text replacement workflow.
+        """
+        selected = list(line_spans or [])
+        plan = dict(plan or {})
+        shifted = list(plan.get("shifted_items") or [])
+        table_rule_plan = dict(plan.get("table_rule_plan") or {})
+        rule_actions = list(table_rule_plan.get("actions") or [])
+        rule_insertions = list(table_rule_plan.get("insertions") or [])
+        shift_dy = float(plan.get("shift_dy") or 0.0)
+
+        if not selected:
+            raise ValueError("Select a full table row before adding a row.")
+        if str(plan.get("position") or "below") != "below":
+            raise ValueError("Only insertion below the selected table row is supported.")
+        if shift_dy <= 0.0:
+            raise ValueError("The table-row insertion plan has no positive row step.")
+
+        doc = page.parent
+        if doc is None:
+            raise ValueError("The edited page is no longer attached to a PDF.")
+        page_number = int(page.number)
+
+        try:
+            source_raw = doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+            )
+        except TypeError:
+            source_raw = doc.tobytes(no_new_id=True)
+        source_doc = pymupdf.open(stream=source_raw, filetype="pdf")
+
+        def _rect(values):
+            rect = pymupdf.Rect(*(float(value) for value in values))
+            rect.normalize()
+            return rect
+
+        def _union_rects(rects):
+            values = [pymupdf.Rect(rect) for rect in rects if rect is not None]
+            if not values:
+                return None
+            result = pymupdf.Rect(values[0])
+            for rect in values[1:]:
+                result |= rect
+            result.normalize()
+            return result
+
+        def _expanded(rect, xpad=4.0, ypad=4.0):
+            rect = pymupdf.Rect(rect)
+            return pymupdf.Rect(
+                rect.x0 - float(xpad),
+                rect.y0 - float(ypad),
+                rect.x1 + float(xpad),
+                rect.y1 + float(ypad),
+            )
+
+        def _compact(value):
+            return re.sub(r"\s+", "", str(value or "").replace("\u00a0", " "))
+
+        def _show_exact_clip(source_page, source_rect, target_rect, label):
+            source_rect = _rect(source_rect) & source_page.rect
+            target_rect = _rect(target_rect) & page.rect
+            if source_rect.is_empty or target_rect.is_empty:
+                raise ValueError(
+                    f"The {label} could not be copied because its PDF clip is empty."
+                )
+            page.show_pdf_page(
+                target_rect,
+                source_doc,
+                page_number,
+                clip=source_rect,
+                keep_proportion=False,
+                overlay=True,
+            )
+
+        def _rule_rect(action, bounds):
+            width = max(0.01, float(action.get("width") or 0.0))
+            endpoint_pad = max(0.35, width * 1.5)
+            vertical_pad = max(0.35, width * 1.5)
+            rect = pymupdf.Rect(
+                float(action["x0"]) - endpoint_pad,
+                float(action["y"]) - vertical_pad,
+                float(action["x1"]) + endpoint_pad,
+                float(action["y"]) + vertical_pad,
+            ) & bounds
+            rect.normalize()
+            return rect
+
+        def _draw_rule(action):
+            target_y = float(action["target_y"])
+            page.draw_line(
+                pymupdf.Point(float(action["x0"]), target_y),
+                pymupdf.Point(float(action["x1"]), target_y),
+                color=tuple(action.get("color") or (0.0,)),
+                dashes=action.get("dashes"),
+                width=max(0.01, float(action.get("width") or 0.0)),
+                lineCap=self._drawing_line_cap(action.get("line_cap")),
+                lineJoin=int(action.get("line_join") or 0),
+                overlay=True,
+                stroke_opacity=float(
+                    action.get("stroke_opacity")
+                    if action.get("stroke_opacity") is not None
+                    else 1.0
+                ),
+            )
+
+        # Build exact whole-line move specs before mutating the page.
+        shifted_groups = {}
+        for item in shifted:
+            span = item.get("span")
+            if span is None:
+                continue
+            key = tuple(
+                item.get("line_key")
+                or (int(span.block_index), int(span.line_index))
+            )
+            shifted_groups.setdefault(key, []).append(item)
+
+        move_specs = []
+        for items in shifted_groups.values():
+            items.sort(
+                key=lambda item: (
+                    float(item["span"].bbox[0]),
+                    int(item["span"].span_index),
+                )
+            )
+            spans = [item["span"] for item in items]
+            source_bbox = _rect(self.line_bbox(spans))
+            target_bbox = _union_rects(
+                [_rect(item["final_bbox"]) for item in items]
+            )
+            move_specs.append(
+                {
+                    "source_bbox": source_bbox,
+                    "target_bbox": target_bbox,
+                    "text": self._line_text(spans),
+                }
+            )
+        move_specs.sort(
+            key=lambda spec: (
+                float(spec["source_bbox"].y0),
+                float(spec["source_bbox"].x0),
+            )
+        )
+
+        template_cells = []
+        selected_groups = self._table_cell_groups(selected)
+        for group in selected_groups:
+            source_bbox = _rect(self.line_bbox(group))
+            target_bbox = pymupdf.Rect(
+                source_bbox.x0,
+                source_bbox.y0 + shift_dy,
+                source_bbox.x1,
+                source_bbox.y1 + shift_dy,
+            )
+            template_cells.append(
+                {
+                    "source_bbox": source_bbox,
+                    "target_bbox": target_bbox,
+                    "text": self._line_text(group),
+                }
+            )
+
+        try:
+            source_page = source_doc[page_number]
+
+            # Keep moved/copied clips free of the old horizontal rule paths.
+            for action in rule_actions:
+                rect = _rule_rect(action, source_page.rect)
+                if not rect.is_empty:
+                    source_page.add_redact_annot(rect, fill=None, cross_out=False)
+            if rule_actions:
+                source_page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                    text=pymupdf.PDF_REDACT_TEXT_NONE,
+                )
+
+            # Remove only later text that will be copied down. The selected
+            # template remains untouched at its original position.
+            seen = set()
+            for item in shifted:
+                span = item.get("span")
+                if span is None:
+                    continue
+                rect = _rect(span.bbox)
+                rect = pymupdf.Rect(
+                    rect.x0 - 0.15,
+                    rect.y0 - 0.10,
+                    rect.x1 + 0.15,
+                    rect.y1 + 0.10,
+                ) & page.rect
+                signature = tuple(round(float(value), 4) for value in rect)
+                if rect.is_empty or signature in seen:
+                    continue
+                seen.add(signature)
+                page.add_redact_annot(rect, fill=None, cross_out=False)
+            if seen:
+                page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+                    text=pymupdf.PDF_REDACT_TEXT_REMOVE,
+                )
+
+            # Move existing safe table rules, then add a separator with exactly
+            # the template rule's visual style below the cloned row.
+            for action in rule_actions:
+                rect = _rule_rect(action, page.rect)
+                if not rect.is_empty:
+                    page.add_redact_annot(rect, fill=None, cross_out=False)
+            if rule_actions:
+                page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                    text=pymupdf.PDF_REDACT_TEXT_NONE,
+                )
+            for action in rule_actions:
+                _draw_rule(action)
+            for action in rule_insertions:
+                _draw_rule(action)
+
+            for spec in move_specs:
+                _show_exact_clip(
+                    source_page,
+                    spec["source_bbox"],
+                    spec["target_bbox"],
+                    "following line",
+                )
+            for spec in template_cells:
+                _show_exact_clip(
+                    source_page,
+                    spec["source_bbox"],
+                    spec["target_bbox"],
+                    "table cell",
+                )
+        finally:
+            source_doc.close()
+
+        # Serialize and reopen immediately.  A failed check is raised to the
+        # caller, which restores its Undo snapshot transactionally.
+        try:
+            check_raw = doc.tobytes(
+                garbage=0,
+                clean=False,
+                deflate=False,
+                no_new_id=True,
+            )
+        except TypeError:
+            check_raw = doc.tobytes(no_new_id=True)
+        probe = pymupdf.open(stream=check_raw, filetype="pdf")
+        inserted_lines = []
+        moved_lines = []
+        try:
+            check_page = probe[page_number]
+
+            def _require_text(spec, label):
+                expected = str(spec.get("text") or "")
+                target = _expanded(
+                    spec["target_bbox"],
+                    xpad=4.0,
+                    ypad=max(4.0, float(spec["target_bbox"].height) * 0.8),
+                ) & check_page.rect
+                observed = check_page.get_text("text", clip=target) or ""
+                present = bool(
+                    _compact(expected)
+                    and _compact(expected) in _compact(observed)
+                )
+                if not present and expected:
+                    try:
+                        present = any(
+                            pymupdf.Rect(hit).intersects(target)
+                            for hit in check_page.search_for(expected)
+                        )
+                    except Exception:
+                        present = False
+                if not present:
+                    raise ValueError(
+                        f"Table-row insertion cancelled: the {label} is not "
+                        f"searchable at its new position. Expected {expected!r}."
+                    )
+                return {
+                    "text": expected,
+                    "bbox": [
+                        float(spec["target_bbox"].x0),
+                        float(spec["target_bbox"].y0),
+                        float(spec["target_bbox"].x1),
+                        float(spec["target_bbox"].y1),
+                    ],
+                }
+
+            inserted_lines = [
+                _require_text(spec, "cloned table cell")
+                for spec in template_cells
+            ]
+            moved_lines = [
+                _require_text(spec, "moved following line")
+                for spec in move_specs
+            ]
+
+            check_rules = self.horizontal_table_rules(check_page)
+
+            def _has_rule(action, target=True):
+                expected_y = float(
+                    action["target_y"] if target else action["y"]
+                )
+                tolerance = max(
+                    0.45,
+                    float(action.get("width") or 0.0) * 1.75,
+                )
+                return any(
+                    abs(float(rule["y"]) - expected_y) <= tolerance
+                    and abs(float(rule["x0"]) - float(action["x0"])) <= 0.75
+                    and abs(float(rule["x1"]) - float(action["x1"])) <= 0.75
+                    for rule in check_rules
+                )
+
+            all_targets = [
+                float(action["target_y"])
+                for action in rule_actions + rule_insertions
+            ]
+            for action in rule_actions:
+                if not _has_rule(action, target=True):
+                    raise ValueError(
+                        "Table-row insertion cancelled: a moved separator is missing."
+                    )
+                old_is_new_target = any(
+                    abs(float(action["y"]) - target) <= max(
+                        0.45,
+                        float(action.get("width") or 0.0) * 1.75,
+                    )
+                    for target in all_targets
+                )
+                if not old_is_new_target and _has_rule(action, target=False):
+                    raise ValueError(
+                        "Table-row insertion cancelled: a separator remains at "
+                        "its original position."
+                    )
+            for action in rule_insertions:
+                if not _has_rule(action, target=True):
+                    raise ValueError(
+                        "Table-row insertion cancelled: the cloned row separator "
+                        "is missing."
+                    )
+        finally:
+            probe.close()
+
+        inserted_bbox = _union_rects(
+            [_rect(item["bbox"]) for item in inserted_lines]
+        )
+        moved_table_rules = [
+            {
+                "from": [
+                    float(action["x0"]), float(action["y"]),
+                    float(action["x1"]), float(action["y"]),
+                ],
+                "to": [
+                    float(action["x0"]), float(action["target_y"]),
+                    float(action["x1"]), float(action["target_y"]),
+                ],
+            }
+            for action in rule_actions
+        ]
+        inserted_table_rules = [
+            [
+                float(action["x0"]), float(action["target_y"]),
+                float(action["x1"]), float(action["target_y"]),
+            ]
+            for action in rule_insertions
+        ]
+        return {
+            "position": "below",
+            "column_count": len(template_cells),
+            "shift_dy": shift_dy,
+            "inserted_bbox": (
+                tuple(float(value) for value in inserted_bbox)
+                if inserted_bbox is not None
+                else tuple(float(value) for value in plan.get("inserted_bbox", ()))
+            ),
+            "inserted_lines": inserted_lines,
+            "moved_lines": moved_lines,
+            "shifted_count": len(shifted),
+            "moved_table_rules": moved_table_rules,
+            "inserted_table_rules": inserted_table_rules,
+            "moved_table_rule_count": len(moved_table_rules),
+            "inserted_table_rule_count": len(inserted_table_rules),
+            "immediate_validation_passed": True,
+        }
+
+
+    def delete_full_line_with_reflow(
+        self,
+        page,
+        line_spans,
+        shifted_items,
+        table_rule_plan=None,
+    ):
         """
         Delete the selected visual line and close the gap by COPYING the
         following PDF line content upward from a pre-edit snapshot.
@@ -734,6 +2396,9 @@ class PdfEngine:
         """
         selected = list(line_spans or [])
         shifted = list(shifted_items or [])
+        table_rule_actions = list(
+            (table_rule_plan or {}).get("actions") or []
+        )
 
         if not selected:
             raise ValueError("No full line is selected.")
@@ -1036,6 +2701,19 @@ class PdfEngine:
                 overlay=True,
             )
 
+        def _table_rule_redaction_rect(action, bounds):
+            stroke_width = max(0.01, float(action.get("width") or 0.0))
+            endpoint_pad = max(0.35, stroke_width * 1.5)
+            vertical_pad = max(0.35, stroke_width * 1.5)
+            rect = pymupdf.Rect(
+                float(action["x0"]) - endpoint_pad,
+                float(action["y"]) - vertical_pad,
+                float(action["x1"]) + endpoint_pad,
+                float(action["y"]) + vertical_pad,
+            ) & bounds
+            rect.normalize()
+            return rect
+
         try:
             source_page = source_doc[page_number]
 
@@ -1207,6 +2885,30 @@ class PdfEngine:
                 previous_slot_text = original_text
                 previous_slot_bbox = original_bbox
 
+            # ``show_pdf_page`` copies the complete source display list behind
+            # each text clip. Remove the acted-on rules from this *temporary*
+            # snapshot first; otherwise every copied cell would embed a hidden
+            # duplicate of each rule even though the clip makes it invisible.
+            if table_rule_actions:
+                for action in table_rule_actions:
+                    rule_rect = _table_rule_redaction_rect(
+                        action,
+                        source_page.rect,
+                    )
+                    if rule_rect.is_empty:
+                        continue
+                    source_page.add_redact_annot(
+                        rule_rect,
+                        fill=None,
+                        cross_out=False,
+                    )
+
+                source_page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                    text=pymupdf.PDF_REDACT_TEXT_NONE,
+                )
+
             # ---------------------------------------------------------
             # Destructively remove the selected line AND every original line
             # that is going to be moved. Apply redactions only once.
@@ -1243,6 +2945,52 @@ class PdfEngine:
                 graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                 text=pymupdf.PDF_REDACT_TEXT_REMOVE,
             )
+
+            # ---------------------------------------------------------
+            # Remove only the independently stroked table-rule paths in the
+            # plan. This is a separate redaction pass so the text rectangles
+            # above can never delete unrelated vector artwork. ``COVERED`` is
+            # used instead of ``TOUCHED`` as an additional safety boundary.
+            # ---------------------------------------------------------
+            if table_rule_actions:
+                for action in table_rule_actions:
+                    rule_rect = _table_rule_redaction_rect(action, page.rect)
+
+                    if rule_rect.is_empty:
+                        continue
+
+                    page.add_redact_annot(
+                        rule_rect,
+                        fill=None,
+                        cross_out=False,
+                    )
+
+                page.apply_redactions(
+                    images=pymupdf.PDF_REDACT_IMAGE_NONE,
+                    graphics=pymupdf.PDF_REDACT_LINE_ART_REMOVE_IF_COVERED,
+                    text=pymupdf.PDF_REDACT_TEXT_NONE,
+                )
+
+                for action in table_rule_actions:
+                    if action.get("action") != "move":
+                        continue
+
+                    target_y = float(action["target_y"])
+                    page.draw_line(
+                        pymupdf.Point(float(action["x0"]), target_y),
+                        pymupdf.Point(float(action["x1"]), target_y),
+                        color=tuple(action.get("color") or (0.0,)),
+                        dashes=action.get("dashes"),
+                        width=max(0.01, float(action.get("width") or 0.0)),
+                        lineCap=self._drawing_line_cap(action.get("line_cap")),
+                        lineJoin=int(action.get("line_join") or 0),
+                        overlay=True,
+                        stroke_opacity=float(
+                            action.get("stroke_opacity")
+                            if action.get("stroke_opacity") is not None
+                            else 1.0
+                        ),
+                    )
 
             # ---------------------------------------------------------
             # Copy original PDF content upward. No font resolver involved.
@@ -1308,14 +3056,65 @@ class PdfEngine:
 
             deleted_region = check_page.get_text("text", clip=deleted_rect)
 
+            # If the next row is an identical clone, correct upward reflow
+            # deliberately places the same searchable text in the deleted
+            # slot. In that case text absence is the wrong invariant. Require
+            # exactly the planned successor content in the slot instead; the
+            # moved-line checks below still verify every copied cell.
+            slot_specs = []
+            selected_rect = _rect(selected_line_bbox)
+            for spec in line_specs:
+                final_rect = pymupdf.Rect(spec["final_bbox"])
+                intersection = final_rect & selected_rect
+                if intersection.is_empty:
+                    continue
+                overlap_height = max(0.0, float(intersection.height))
+                minimum_height = max(
+                    0.01,
+                    min(float(final_rect.height), float(selected_rect.height)),
+                )
+                if overlap_height / minimum_height >= 0.50:
+                    slot_specs.append(spec)
+
+            slot_specs.sort(
+                key=lambda spec: (
+                    float(spec["final_bbox"].x0),
+                    float(spec["final_bbox"].y0),
+                )
+            )
+            slot_text = " ".join(
+                str(spec.get("replacement_text") or "").strip()
+                for spec in slot_specs
+                if str(spec.get("replacement_text") or "").strip()
+            ).strip()
+            identical_successor_in_deleted_slot = bool(
+                _compact(selected_line_text)
+                and _compact(slot_text) == _compact(selected_line_text)
+            )
+
             if (
                 _compact(selected_line_text)
                 and _compact(selected_line_text) in _compact(deleted_region)
+                and not identical_successor_in_deleted_slot
             ):
                 raise ValueError(
                     "Line deletion cancelled: the complete original line is still "
                     "searchable in the deleted line position."
                 )
+
+            if identical_successor_in_deleted_slot:
+                region_compact = _compact(deleted_region)
+                expected_counts = {}
+                for spec in slot_specs:
+                    value = _compact(spec.get("replacement_text") or "")
+                    if value:
+                        expected_counts[value] = expected_counts.get(value, 0) + 1
+                for value, expected_count in expected_counts.items():
+                    if region_compact.count(value) > expected_count:
+                        raise ValueError(
+                            "Line deletion cancelled: duplicate searchable copies "
+                            "remain in the deleted row position."
+                        )
 
             moved_lines = []
 
@@ -1370,8 +3169,93 @@ class PdfEngine:
                     }
                 )
 
+            # Confirm every requested rule move is present and that an old
+            # position is gone unless another moved rule intentionally lands
+            # on that same coordinate.
+            check_rules = self.horizontal_table_rules(check_page)
+            moved_targets = [
+                action
+                for action in table_rule_actions
+                if action.get("action") == "move"
+            ]
+
+            def _same_rule_position(rule, action, target=False):
+                expected_y = (
+                    float(action["target_y"])
+                    if target
+                    else float(action["y"])
+                )
+                tolerance = max(
+                    0.45,
+                    float(action.get("width") or 0.0) * 1.75,
+                )
+                return (
+                    abs(float(rule["y"]) - expected_y) <= tolerance
+                    and abs(float(rule["x0"]) - float(action["x0"])) <= 0.75
+                    and abs(float(rule["x1"]) - float(action["x1"])) <= 0.75
+                )
+
+            for action in table_rule_actions:
+                if action.get("action") == "move" and not any(
+                    _same_rule_position(rule, action, target=True)
+                    for rule in check_rules
+                ):
+                    raise ValueError(
+                        "Line reflow cancelled: a table rule was not restored "
+                        "at its moved position."
+                    )
+
+                target_occupies_old_position = any(
+                    abs(float(target["target_y"]) - float(action["y"]))
+                    <= max(
+                        0.45,
+                        float(action.get("width") or 0.0) * 1.75,
+                    )
+                    and abs(float(target["x0"]) - float(action["x0"])) <= 0.75
+                    and abs(float(target["x1"]) - float(action["x1"])) <= 0.75
+                    for target in moved_targets
+                )
+
+                if not target_occupies_old_position and any(
+                    _same_rule_position(rule, action, target=False)
+                    for rule in check_rules
+                ):
+                    raise ValueError(
+                        "Line reflow cancelled: an original table rule remains "
+                        "at its old position."
+                    )
+
         finally:
             probe.close()
+
+        moved_table_rules = [
+            {
+                "from": [
+                    float(action["x0"]),
+                    float(action["y"]),
+                    float(action["x1"]),
+                    float(action["y"]),
+                ],
+                "to": [
+                    float(action["x0"]),
+                    float(action["target_y"]),
+                    float(action["x1"]),
+                    float(action["target_y"]),
+                ],
+            }
+            for action in table_rule_actions
+            if action.get("action") == "move"
+        ]
+        removed_table_rules = [
+            [
+                float(action["x0"]),
+                float(action["y"]),
+                float(action["x1"]),
+                float(action["y"]),
+            ]
+            for action in table_rule_actions
+            if action.get("action") == "remove"
+        ]
 
         return {
             "deleted_bbox": tuple(float(v) for v in selected_line_bbox),
@@ -1383,6 +3267,8 @@ class PdfEngine:
                 for spec in line_specs
                 if spec.get("kind") == "numbered"
             ),
+            "moved_table_rules": moved_table_rules,
+            "removed_table_rules": removed_table_rules,
         }
 
     def delete_full_line(self, page, line_spans):

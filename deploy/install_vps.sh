@@ -12,7 +12,7 @@ app_user="pdfeditor"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y python3 python3-venv nginx certbot python3-certbot-nginx
+apt-get install -y python3 python3-venv libfreetype6 nginx certbot python3-certbot-nginx
 
 if ! id "$app_user" >/dev/null 2>&1; then
     useradd --system --home-dir "$app_dir" --shell /usr/sbin/nologin "$app_user"

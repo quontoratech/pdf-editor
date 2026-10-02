@@ -12,10 +12,10 @@ import uuid
 import hashlib
 import hmac
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote_plus
 
 import pymupdf
@@ -40,7 +40,13 @@ except ImportError:
 
 
 from app.clean_edit_session import CleanEditSession, APP_NAME
-from app.cff_subset_extender import extension_unicode_widths, inspect_existing_cff
+from app.cff_subset_extender import (
+    build_adaptive_external_glyph_plan,
+    build_adaptive_pdf_glyph_plan,
+    extension_unicode_widths,
+    inspect_existing_cff,
+    verify_donor_compatibility,
+)
 from app.docx_reference import DocxReferenceIndex
 from app.env import load_env_file
 from app.font_resolver import FontResolver, humanize_pdf_font_name
@@ -49,13 +55,14 @@ from app.font_utils import (
     font_path_has_text,
     font_flags_text,
     normalize_font_name,
+    read_font_metadata_from_path,
     strip_subset_prefix,
     weight_label,
     weight_from_flags,
     italic_from_flags,
 )
 from app.pdf_engine import PdfEngine
-from app.models import FontResolution
+from app.models import FontCandidate, FontResolution
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -127,6 +134,20 @@ class TextRequest(BaseModel):
     replacement: str
     direction: str = "right"
     fallback_token: str | None = None
+
+
+class DeleteLineRequest(BaseModel):
+    # Backward-compatible default: preserve every detected rule and move it
+    # with the upward row reflow. Removing the deleted row's boundary is an
+    # explicit user choice.
+    remove_table_rule: bool = False
+
+
+class InsertTableRowRequest(BaseModel):
+    # The first safe UI supports insertion directly below the selected row.
+    # Keeping this explicit in the request leaves room for an "above" control
+    # later without accepting an arbitrary placement now.
+    position: str = "below"
 
 
 class LoginRequest(BaseModel):
@@ -608,8 +629,16 @@ class FontLibraryStore:
         target_weight: int,
         target_italic: bool,
         destination_dir: Path,
+        require_exact_face: bool = False,
+        candidate_validator: Callable | None = None,
     ):
-        """Return the closest stored face that covers every requested glyph."""
+        """Return the best stored face that safely covers the required glyphs.
+
+        Subset completion can request an exact face and provide a validator
+        that compares the materialized font with the original embedded CFF.
+        Rejected candidates are skipped so a later genuine match can still be
+        selected.
+        """
         if not replacement:
             raise ValueError("Enter replacement text before choosing a fallback font.")
         target_norm = normalize_font_name(target_family)
@@ -641,24 +670,61 @@ class FontLibraryStore:
 
         ranked.sort(key=lambda item: (item[0], str(item[1].get("_id", ""))))
         missing_reports = []
+        rejected_face_reports = []
         for score, record, similarity in ranked:
+            candidate_weight = int(record.get("weight") or 400)
+            requested_weight = int(target_weight)
+            weight_delta = abs(candidate_weight - requested_weight)
+            italic_match = bool(record.get("italic")) == bool(target_italic)
+            family_exact = float(similarity) >= 0.995
+
+            if require_exact_face and (
+                not family_exact
+                or weight_delta > 100
+                or not italic_match
+            ):
+                rejected_face_reports.append(
+                    (
+                        record.get("full_name") or record.get("family") or "Unknown font",
+                        (
+                            f"family match={family_exact}, target weight={requested_weight}, "
+                            f"candidate weight={candidate_weight}, style match={italic_match}"
+                        ),
+                    )
+                )
+                continue
+
             path, materialized = self.materialize_font(
                 str(record["_id"]),
                 destination_dir,
             )
             glyphs_ok, missing = font_path_has_text(str(path), replacement)
             if glyphs_ok:
-                candidate_weight = int(record.get("weight") or 400)
-                target_weight = int(target_weight)
-                weight_delta = abs(candidate_weight - target_weight)
-                return path, materialized, {
+                score_details = {
                     "score": float(score),
                     "family_similarity": float(similarity),
                     "weight_delta": weight_delta,
-                    "target_weight": target_weight,
+                    "target_weight": requested_weight,
                     "candidate_weight": candidate_weight,
-                    "italic_match": bool(record.get("italic")) == bool(target_italic),
+                    "italic_match": italic_match,
                 }
+                if candidate_validator is not None:
+                    accepted, reason = candidate_validator(
+                        path,
+                        materialized,
+                        score_details,
+                    )
+                    if not accepted:
+                        rejected_face_reports.append(
+                            (
+                                record.get("full_name")
+                                or record.get("family")
+                                or "Unknown font",
+                                str(reason or "outline fingerprint mismatch"),
+                            )
+                        )
+                        continue
+                return path, materialized, score_details
             if missing:
                 missing_reports.append((record.get("full_name") or record.get("family"), missing))
 
@@ -666,8 +732,22 @@ class FontLibraryStore:
             f"{name}: {' '.join(repr(ch) for ch in missing[:6])}"
             for name, missing in missing_reports[:3]
         )
+        rejected_preview = "; ".join(
+            f"{name}: {reason}"
+            for name, reason in rejected_face_reports[:3]
+        )
+        if require_exact_face:
+            raise ValueError(
+                "No safe exact-family, weight/style and outline-compatible full font "
+                f"in the database contains the required glyphs {replacement!r}. "
+                "The original PDF was not changed. Upload the exact full font face; "
+                "a neighboring weight will not be inserted into the original subset."
+                + (f" Rejected candidates: {rejected_preview}." if rejected_preview else "")
+                + (f" Missing-glyph checks: {preview}." if preview else "")
+            )
         raise ValueError(
-            "No saved MongoDB font contains every replacement glyph."
+            "No saved MongoDB font contains and safely matches every required glyph."
+            + (f" Rejected candidates: {rejected_preview}." if rejected_preview else "")
             + (f" Checked examples: {preview}" if preview else "")
         )
 
@@ -907,6 +987,8 @@ class WebEditorSession:
 
         self.selected_line_spans = []
 
+        self.selected_row_info = None
+
         self.selected_docx_ref = None
 
         self.current_resolution = None
@@ -1033,11 +1115,180 @@ class WebEditorSession:
             )
         )
 
+    @staticmethod
+    def _span_order_key(span):
+        return (
+            float(span.origin[1]),
+            float(span.bbox[0]),
+            int(span.block_index),
+            int(span.line_index),
+            int(span.span_index),
+        )
+
+    @staticmethod
+    def _translated_span(span, *, text=None, bbox=None, origin=None):
+        """Return a style-identical cached span at its validated new geometry."""
+        return replace(
+            span,
+            text=span.text if text is None else str(text),
+            bbox=tuple(float(value) for value in (bbox or span.bbox)),
+            origin=tuple(float(value) for value in (origin or span.origin)),
+        )
+
+    def _update_spans_after_line_delete(
+        self,
+        before_spans,
+        selected_spans,
+        shifted_items,
+        moved_lines,
+    ):
+        """Update the browser hit-test index without re-parsing copied Forms.
+
+        ``show_pdf_page`` deliberately preserves the source PDF's exact font
+        resources, but its clipped full-page Form wrappers are expensive for
+        PyMuPDF's ``get_text('dict')`` traversal.  The engine has already
+        serialized and validated every destination line, so derive the new
+        selectable spans from that validated transaction instead of scanning
+        the same full-page display list once per moved line.
+        """
+        selected_ids = {id(span) for span in (selected_spans or [])}
+        groups = {}
+        for item in shifted_items or []:
+            span = item.get("span")
+            if span is None:
+                continue
+            key = tuple(
+                item.get("line_key")
+                or (int(span.block_index), int(span.line_index))
+            )
+            groups.setdefault(key, []).append(item)
+
+        actual_records = [dict(item) for item in (moved_lines or [])]
+        unused_records = set(range(len(actual_records)))
+        replacements = {}
+
+        def bbox_distance(first, second):
+            return sum(
+                abs(float(a) - float(b))
+                for a, b in zip(first or (), second or ())
+            )
+
+        def normalized(value):
+            return " ".join(str(value or "").split())
+
+        for items in groups.values():
+            items.sort(
+                key=lambda item: (
+                    float(item["span"].bbox[0]),
+                    int(item["span"].span_index),
+                )
+            )
+            final_bbox = (
+                min(float(item["final_bbox"][0]) for item in items),
+                min(float(item["final_bbox"][1]) for item in items),
+                max(float(item["final_bbox"][2]) for item in items),
+                max(float(item["final_bbox"][3]) for item in items),
+            )
+            record_index = None
+            if unused_records:
+                record_index = min(
+                    unused_records,
+                    key=lambda index: bbox_distance(
+                        actual_records[index].get("bbox"),
+                        final_bbox,
+                    ),
+                )
+                unused_records.remove(record_index)
+
+            actual_text = (
+                str(actual_records[record_index].get("text") or "")
+                if record_index is not None
+                else ""
+            )
+            original_text = self.engine._line_text(
+                [item["span"] for item in items]
+            )
+            planned_text = " ".join(
+                str(item.get("text") or "").strip()
+                for item in items
+                if str(item.get("text") or "").strip()
+            ).strip()
+
+            use_original = (
+                actual_text
+                and normalized(actual_text) == normalized(original_text)
+                and normalized(actual_text) != normalized(planned_text)
+            )
+
+            for item in items:
+                span = item["span"]
+                final_text = span.text if use_original else item.get("text", span.text)
+                if len(items) == 1 and actual_text:
+                    final_text = actual_text
+                replacements[id(span)] = self._translated_span(
+                    span,
+                    text=final_text,
+                    bbox=item.get("final_bbox"),
+                    origin=item.get("origin"),
+                )
+
+        updated = []
+        for span in before_spans or []:
+            if id(span) in selected_ids:
+                continue
+            updated.append(replacements.get(id(span), span))
+        self.spans = sorted(updated, key=self._span_order_key)
+
+    def _update_spans_after_row_insert(
+        self,
+        before_spans,
+        selected_spans,
+        shifted_items,
+        shift_dy,
+    ):
+        """Cache exact moved spans plus a style-identical clone of each cell."""
+        replacements = {}
+        for item in shifted_items or []:
+            span = item.get("span")
+            if span is None:
+                continue
+            replacements[id(span)] = self._translated_span(
+                span,
+                text=item.get("text", span.text),
+                bbox=item.get("final_bbox"),
+                origin=item.get("origin"),
+            )
+
+        updated = [
+            replacements.get(id(span), span)
+            for span in (before_spans or [])
+        ]
+        dy = float(shift_dy)
+        for span in selected_spans or []:
+            updated.append(
+                self._translated_span(
+                    span,
+                    bbox=(
+                        float(span.bbox[0]),
+                        float(span.bbox[1]) + dy,
+                        float(span.bbox[2]),
+                        float(span.bbox[3]) + dy,
+                    ),
+                    origin=(
+                        float(span.origin[0]),
+                        float(span.origin[1]) + dy,
+                    ),
+                )
+            )
+        self.spans = sorted(updated, key=self._span_order_key)
+
     def clear_selection(self):
 
         self.selected_span = None
 
         self.selected_line_spans = []
+
+        self.selected_row_info = None
 
         self.selected_docx_ref = None
 
@@ -1231,6 +1482,7 @@ class WebEditorSession:
         self.approved_fallback = None
         self.selected_span = span
         self.selected_line_spans = []
+        self.selected_row_info = None
 
         self.populate_docx_reference()
 
@@ -1251,11 +1503,13 @@ class WebEditorSession:
         line_spans = self.engine.full_line_spans(
             self.spans,
             self.selected_span,
+            page=self.doc[self.page_index],
         )
         if not line_spans:
             raise ValueError("The full text line could not be detected.")
 
         self.selected_line_spans = list(line_spans)
+        self.selected_row_info = self._selected_table_row_info()
         self.current_resolution = None
         self.approved_fallback = None
         self.selected_docx_ref = None
@@ -1268,10 +1522,207 @@ class WebEditorSession:
         self.match_status = (
             f"✓ FULL LINE SELECTED\n"
             f"{len(self.selected_line_spans)} text span(s) selected.\n"
-            "Use 'Delete Full Line' to remove this line."
+            "Use 'Delete Full Line' to remove this line. For a detected "
+            "multi-column table row, 'Add Full Row Below' clones every cell "
+            "with its original PDF styling. Horizontal table "
+            "rules move with their rows by default; enable the separator "
+            "option only when that boundary should be removed."
         )
         self.match_tone = "success"
         self.status = f"Full line selected: {line_text[:120]}"
+
+    def _selected_table_row_info(self):
+        """Describe the selected row without running the structural planner.
+
+        This stays intentionally cheap because ``state()`` is returned after
+        most browser actions.  The actual insertion engine performs the full
+        table/rule/overflow validation before changing the PDF.
+        """
+        selected = sorted(
+            list(self.selected_line_spans or []),
+            key=lambda span: (
+                float(span.bbox[0]),
+                float(span.bbox[1]),
+                int(span.span_index),
+            ),
+        )
+        if not selected:
+            return {
+                "eligible": False,
+                "column_count": 0,
+                "reason": "Select a full table row to enable row insertion.",
+            }
+
+        try:
+            has_columns = self.engine._has_table_column_layout(selected)
+        except Exception:
+            has_columns = False
+
+        groups = []
+        for span in selected:
+            if not groups:
+                groups.append([span])
+                continue
+
+            previous = groups[-1][-1]
+            typical_size = max(
+                1.0,
+                float(previous.size),
+                float(span.size),
+            )
+            column_gap = max(24.0, typical_size * 3.0)
+            gap = float(span.bbox[0]) - float(previous.bbox[2])
+            if gap > column_gap:
+                groups.append([span])
+            else:
+                groups[-1].append(span)
+
+        column_count = len(groups) if has_columns else 0
+        if column_count < 2:
+            return {
+                "eligible": False,
+                "column_count": column_count,
+                "reason": (
+                    "The selected full line is not a safely detected "
+                    "multi-column table row. Select a row with at least two "
+                    "separated cells and a matching horizontal table rule."
+                ),
+            }
+
+        return {
+            "eligible": True,
+            "column_count": int(column_count),
+            "reason": "",
+            "cell_text": [
+                " ".join(
+                    item.text.strip()
+                    for item in group
+                    if item.text.strip()
+                )
+                for group in groups
+            ],
+        }
+
+    def add_selected_row_below(self, *, position: str = "below"):
+        if not self.doc or not self.selected_line_spans:
+            raise ValueError("Select a full table row before adding a row.")
+        if str(position or "below").lower() != "below":
+            raise ValueError("This version can add a table row below the selected row only.")
+
+        page = self.doc[self.page_index]
+        line_spans = list(self.selected_line_spans)
+        before_spans = list(self.spans)
+        template_text = " ".join(
+            span.text.strip()
+            for span in line_spans
+            if span.text.strip()
+        )
+
+        # Planning is read-only and runs before the Undo snapshot so rejected
+        # non-table rows / page-overflow cases leave no session mutation.
+        plan = self.engine.plan_insert_table_row(
+            page,
+            self.spans,
+            line_spans,
+            position="below",
+        )
+        shifted_items = list(plan.get("shifted_items") or [])
+        shift_dy = float(plan.get("shift_dy") or 0.0)
+        column_count = int(plan.get("column_count") or 0)
+        if column_count < 2:
+            raise ValueError(
+                "The selected line is not a safely detected multi-column table row."
+            )
+
+        self._snapshot_for_structural_edit()
+        try:
+            if self.edit_session:
+                self.edit_session._inline_line_reflow_forms(self.doc)
+            result = self.engine.insert_table_row_with_reflow(
+                page,
+                line_spans,
+                plan,
+            )
+            column_count = int(result.get("column_count") or column_count)
+
+            if self.edit_session:
+                page_number = self.page_index + 1
+                source_bboxes = [
+                    item["span"].bbox
+                    for item in shifted_items
+                    if item.get("span") is not None
+                ]
+                self.edit_session.shift_for_table_row_insert(
+                    page_number,
+                    source_bboxes,
+                    shift_dy,
+                )
+                self.edit_session.record_table_row_insert_operation(
+                    page_number=page_number,
+                    template_text=(
+                        result.get("template_text")
+                        or plan.get("template_text")
+                        or template_text
+                    ),
+                    inserted_bbox=(
+                        result.get("inserted_bbox")
+                        or plan.get("inserted_bbox")
+                    ),
+                    inserted_lines=result.get("inserted_lines") or [],
+                    moved_lines=result.get("moved_lines") or [],
+                    moved_table_rules=result.get("moved_table_rules") or [],
+                    inserted_table_rules=result.get("inserted_table_rules") or [],
+                    column_count=column_count,
+                    position="below",
+                )
+
+            moved_count = int(
+                result.get("shifted_count", result.get("moved_count", 0)) or 0
+            )
+            moved_rule_count = int(
+                result.get(
+                    "moved_table_rule_count",
+                    len(result.get("moved_table_rules") or []),
+                )
+                or 0
+            )
+            inserted_rule_count = int(
+                result.get(
+                    "inserted_table_rule_count",
+                    len(result.get("inserted_table_rules") or []),
+                )
+                or 0
+            )
+
+            self._update_spans_after_row_insert(
+                before_spans,
+                line_spans,
+                shifted_items,
+                shift_dy,
+            )
+            self.clear_selection()
+            self.last_output = None
+            self.last_audit = None
+            self.last_validation = None
+            self.status = (
+                f"Added a {column_count}-column table row below the selected row."
+            )
+            self.match_status = (
+                "✓ FULL TABLE ROW ADDED\n"
+                f"Cloned {column_count} detected table column(s) from the "
+                "selected row using its existing PDF content and font resources.\n"
+                f"Moved {moved_count} later text span(s) and {moved_rule_count} "
+                "existing table line(s) downward; inserted "
+                f"{inserted_rule_count} separator line(s).\n"
+                "Click each cloned cell and use the normal text replacement "
+                "workflow to enter the new row values."
+            )
+            self.match_tone = "success"
+            return result
+
+        except Exception:
+            self._rollback_last_snapshot()
+            raise
 
     def _snapshot_pdf_bytes(self):
         """Serialize Undo state without compacting or renumbering PDF objects."""
@@ -1301,6 +1752,11 @@ class WebEditorSession:
                 self.edit_session.edits if self.edit_session else []
             ),
             "page_index": int(self.page_index),
+            # Reuse the already verified hit-test index on Undo / rollback.
+            # A snapshot may itself contain clipped row-copy Forms, and
+            # rebuilding a full text dictionary through them is precisely the
+            # slow path structural edits avoid.
+            "spans": copy.deepcopy(self.spans),
         }
         self.undo_stack.append((raw, structural_state))
 
@@ -1353,6 +1809,103 @@ class WebEditorSession:
             self._rollback_last_snapshot()
             raise
 
+    def delete_table_line_at(self, x: float, y: float):
+        """Delete one safe horizontal table rule nearest the clicked point."""
+        if not self.doc:
+            raise ValueError("No PDF is open.")
+
+        click_x = float(x)
+        click_y = float(y)
+
+        # Resolve a miss or ambiguous click before creating an Undo snapshot.
+        # A harmless retry must not clear the current text selection or alter
+        # any server-side session state.
+        preview_rule = self.engine.nearest_horizontal_table_rule(
+            self.doc[self.page_index],
+            click_x,
+            click_y,
+            tolerance=6.0,
+        )
+        if preview_rule is None:
+            raise ValueError(
+                "No independently stroked horizontal table line was found "
+                "within 6.0 PDF points of that position. Zoom in and click "
+                "directly on the line."
+            )
+
+        # Standalone rule deletion is structural and independently undoable.
+        # Keep one snapshot per click so several lines can be removed and then
+        # undone one by one.
+        self._snapshot_for_structural_edit()
+
+        try:
+            # A preceding full-line reflow temporarily uses clipped Form
+            # XObjects for exact text copies. PyMuPDF's graphics redaction
+            # rewrites those wrappers under generic names, which prevents the
+            # normal final-export flattener from collecting them and can change
+            # the xref profile. Flatten the verified wrappers *before* this
+            # graphics-only edit; Undo still restores the pre-flatten snapshot.
+            preflattened_forms = []
+            if self.edit_session:
+                preflattened_forms = (
+                    self.edit_session._inline_line_reflow_forms(self.doc)
+                )
+
+            page = self.doc[self.page_index]
+            result = self.engine.delete_horizontal_table_rule_at(
+                page,
+                click_x,
+                click_y,
+                tolerance=6.0,
+            )
+            result["preflattened_line_reflow_forms"] = preflattened_forms
+
+            rule_bbox = result.get("bbox")
+            rule = result.get("rule")
+
+            if self.edit_session:
+                self.edit_session.record_table_rule_delete_operation(
+                    page_number=self.page_index + 1,
+                    bbox=rule_bbox,
+                    rule=rule,
+                    click=(click_x, click_y),
+                )
+
+            # Graphics-only deletion cannot change the searchable text index.
+            # Reusing the already validated spans also avoids an expensive
+            # recursive text-dictionary scan after earlier line reflows.
+            self.clear_selection()
+            self.last_output = None
+            self.last_audit = None
+            self.last_validation = None
+
+            deleted_y = click_y
+            if rule_bbox is not None:
+                try:
+                    deleted_y = (
+                        float(rule_bbox[1]) + float(rule_bbox[3])
+                    ) / 2.0
+                except (IndexError, TypeError, ValueError):
+                    pass
+
+            self.status = (
+                "Deleted one horizontal table line at "
+                f"y={deleted_y:.2f} pt on page {self.page_index + 1}."
+            )
+            self.match_status = (
+                "✓ TABLE LINE DELETED\n"
+                "Only the safe horizontal rule nearest your click was removed.\n"
+                "Text and unrelated page graphics were not changed.\n"
+                "Table-line delete mode remains active in the browser so you "
+                "can click another line, or use Undo Last."
+            )
+            self.match_tone = "success"
+            return result
+
+        except Exception:
+            self._rollback_last_snapshot()
+            raise
+
     def delete_current_page(self):
         if not self.doc:
             raise ValueError("No PDF is open.")
@@ -1389,12 +1942,13 @@ class WebEditorSession:
             self._rollback_last_snapshot()
             raise
 
-    def delete_selected_line(self):
+    def delete_selected_line(self, *, remove_table_rule: bool = False):
         if not self.doc or not self.selected_line_spans:
             raise ValueError("Select a full line before deleting it.")
 
         page = self.doc[self.page_index]
         line_spans = list(self.selected_line_spans)
+        before_spans = list(self.spans)
         line_text = " ".join(
             span.text.strip()
             for span in line_spans
@@ -1413,6 +1967,7 @@ class WebEditorSession:
             self.spans,
             line_spans,
             page.rect,
+            page=page,
         )
 
         prepared_shifted_items = [
@@ -1420,15 +1975,26 @@ class WebEditorSession:
             for item in plan.get("shifted_items", [])
         ]
 
+        table_rule_plan = self.engine.plan_table_rule_reflow(
+            page,
+            line_spans,
+            prepared_shifted_items,
+            plan.get("shift_dy", 0.0),
+            remove_deleted_row_rule=bool(remove_table_rule),
+        )
+
         # This operation changes PDF content and earlier edit locations,
         # so keep a complete Undo / rollback snapshot.
         self._snapshot_for_structural_edit()
 
         try:
+            if self.edit_session:
+                self.edit_session._inline_line_reflow_forms(self.doc)
             result = self.engine.delete_full_line_with_reflow(
                 page,
                 line_spans,
                 prepared_shifted_items,
+                table_rule_plan=table_rule_plan,
             )
 
             if self.edit_session:
@@ -1465,13 +2031,59 @@ class WebEditorSession:
                     ),
                     deleted_bbox=deleted_bbox,
                     moved_lines=result.get("moved_lines", []),
+                    moved_table_rule_count=int(
+                        result.get(
+                            "moved_table_rule_count",
+                            result.get(
+                                "moved_rule_count",
+                                len(result.get("moved_table_rules", []) or []),
+                            ),
+                        )
+                        or 0
+                    ),
+                    removed_table_rule_count=int(
+                        result.get(
+                            "removed_table_rule_count",
+                            result.get(
+                                "removed_rule_count",
+                                len(result.get("removed_table_rules", []) or []),
+                            ),
+                        )
+                        or 0
+                    ),
+                    remove_table_rule=bool(remove_table_rule),
                 )
 
             shifted_count = int(result.get("shifted_count", 0) or 0)
             renumbered_count = int(result.get("renumbered_count", 0) or 0)
+            moved_rule_count = int(
+                result.get(
+                    "moved_table_rule_count",
+                    result.get(
+                        "moved_rule_count",
+                        len(result.get("moved_table_rules", []) or []),
+                    ),
+                )
+                or 0
+            )
+            removed_rule_count = int(
+                result.get(
+                    "removed_table_rule_count",
+                    result.get(
+                        "removed_rule_count",
+                        len(result.get("removed_table_rules", []) or []),
+                    ),
+                )
+                or 0
+            )
 
+            self._update_spans_after_line_delete(
+                before_spans,
+                line_spans,
+                prepared_shifted_items,
+                result.get("moved_lines", []),
+            )
             self.clear_selection()
-            self.refresh_spans()
             self.last_output = None
             self.last_audit = None
             self.last_validation = None
@@ -1490,6 +2102,17 @@ class WebEditorSession:
                     )
             else:
                 extra = "No later text in the same visual content flow needed to move."
+
+            if moved_rule_count:
+                extra += (
+                    f" Moved {moved_rule_count} horizontal table line(s) upward "
+                    "with the remaining rows."
+                )
+            if removed_rule_count:
+                extra += (
+                    f" Removed {removed_rule_count} separator line(s) belonging "
+                    "to the deleted row."
+                )
 
             self.match_status = (
                 "✓ FULL LINE DELETED AND REFLOWED\n"
@@ -1858,6 +2481,57 @@ class WebEditorSession:
             )
         )
 
+        # A manually loaded, installed, or downloaded full font can carry the
+        # expected family/weight metadata while still being a different face.
+        # When that font would donate glyph programs to the original Type1C
+        # subset, verify its outlines before exposing the resolution as ready.
+        # Original PDF resources that need no external donor have no attached
+        # subset-extension source and intentionally bypass this check.
+        if (
+            resolution
+            and resolution.ok
+            and resolution.candidate
+            and resolution.exact_family
+            and resolution.exact_weight
+            and resolution.exact_style
+            and resolution.glyphs_ok
+        ):
+            candidate = resolution.candidate
+            has_external_donor = bool(
+                getattr(candidate, "subset_extension_font_path", None)
+                or getattr(candidate, "subset_extension_font_bytes", None)
+            )
+            if getattr(candidate, "extend_original_cff", False) and has_external_donor:
+                compatibility = verify_donor_compatibility(
+                    self.doc,
+                    candidate,
+                    self.selected_span.text,
+                )
+                if not compatibility.get("ok"):
+                    resolution = FontResolution(
+                        ok=False,
+                        reason=(
+                            "The proposed full-font donor was rejected before editing "
+                            "because its glyph outlines do not match the selected PDF "
+                            "font closely enough. "
+                            + str(
+                                compatibility.get("reason")
+                                or "Outline fingerprint verification failed."
+                            )
+                            + " The original PDF was not changed. Upload the genuine "
+                            "full font face."
+                        ),
+                        missing_chars=list(resolution.missing_chars or []),
+                    )
+                else:
+                    verification_note = str(compatibility.get("reason") or "").strip()
+                    if verification_note:
+                        resolution.source_note = (
+                            str(resolution.source_note or "").rstrip()
+                            + " Donor outline verification: "
+                            + verification_note
+                        ).strip()
+
         self.current_resolution = (
             resolution
         )
@@ -2055,6 +2729,27 @@ class WebEditorSession:
             raise ValueError("Select PDF text before searching its embedded fonts.")
         page = self.doc[self.page_index]
         replacement = str(replacement or "")
+        candidate = None
+        note = ""
+        missing = []
+        fallback_mode = "pdf_glyph_resource"
+        adaptive_error = ""
+
+        selected_font_record = self.font_resolver.find_page_font(
+            page,
+            self.selected_span,
+        )
+        selected_xref = int((selected_font_record or {}).get("xref", 0) or 0)
+        selected_refname = str(
+            (selected_font_record or {}).get("refname", "") or ""
+        ).lstrip("/")
+        precise_cff_missing = []
+        if selected_xref > 0:
+            _can_encode, precise_cff_missing, _widths = inspect_existing_cff(
+                self.doc,
+                selected_xref,
+                replacement,
+            )
 
         # A Type1C subset may already contain the outlines even when its current
         # one-byte Encoding / ToUnicode maps cannot emit the requested text.
@@ -2074,6 +2769,66 @@ class WebEditorSession:
             )
             missing = []
         else:
+            # When the selected CFF is genuinely missing glyph programs, first
+            # try to borrow those outlines from other embedded CFF resources.
+            # The donor is not inserted as-is: shared target/donor glyphs are
+            # measured, the required emboldening and geometry are calibrated,
+            # and only the missing programs are appended to the original /F#.
+            if precise_cff_missing and selected_xref > 0 and selected_refname:
+                try:
+                    missing_text = "".join(dict.fromkeys(precise_cff_missing))
+                    plan = build_adaptive_pdf_glyph_plan(
+                        self.doc,
+                        selected_xref,
+                        missing_text,
+                        self.selected_span.text,
+                    )
+                    target_family, target_weight, target_italic = (
+                        self.target_font_profile()
+                    )
+                    basefont = str(
+                        (selected_font_record or {}).get("basefont", "") or ""
+                    )
+                    candidate = FontCandidate(
+                        path=None,
+                        family=target_family,
+                        full_name=(
+                            strip_subset_prefix(basefont)
+                            or strip_subset_prefix(self.selected_span.font)
+                        ),
+                        postscript=(
+                            strip_subset_prefix(basefont)
+                            or strip_subset_prefix(self.selected_span.font)
+                        ),
+                        weight=target_weight,
+                        italic=target_italic,
+                        source="Original PDF Type1C + calibrated PDF glyphs",
+                        pdf_refname=selected_refname,
+                        pdf_xref=selected_xref,
+                        extend_original_cff=True,
+                        adaptive_glyph_plan=plan,
+                    )
+                    candidate.pdf_unicode_widths = extension_unicode_widths(
+                        self.doc,
+                        candidate,
+                        replacement,
+                    )
+                    source_xrefs = ", ".join(
+                        str(source.get("font_xref"))
+                        for source in plan.get("sources", [])
+                    )
+                    note = (
+                        str(plan.get("report") or "").strip()
+                        + f" Donor xref(s): {source_xrefs}. "
+                        "Existing target glyph programs, byte codes and resource "
+                        "identity remain unchanged; the replacement remains searchable."
+                    ).strip()
+                    missing = []
+                    fallback_mode = "adaptive_pdf_glyph"
+                except Exception as exc:
+                    adaptive_error = str(exc)
+
+        if not candidate:
             candidate, note, missing = (
                 self.font_resolver._existing_pdf_resource_candidate(
                     self.doc,
@@ -2082,20 +2837,6 @@ class WebEditorSession:
                     replacement,
                 )
             )
-
-        precise_cff_missing = []
-        selected_font_record = self.font_resolver.find_page_font(
-            page,
-            self.selected_span,
-        )
-        if selected_font_record:
-            selected_xref = int(selected_font_record.get("xref", 0) or 0)
-            if selected_xref > 0:
-                _can_encode, precise_cff_missing, _widths = inspect_existing_cff(
-                    self.doc,
-                    selected_xref,
-                    replacement,
-                )
         if not candidate:
             composite_candidate, composite_note, composite_missing = (
                 self.font_resolver.composite_pdf_resource_candidate(
@@ -2119,10 +2860,12 @@ class WebEditorSession:
                 missing = list(precise_cff_missing)
                 note = (
                     "The original embedded CFF subset is missing the listed glyphs, "
-                    "and no directly reusable same-family resource elsewhere in "
-                    "this PDF supplies them. Use 'Complete Original Subset from DB' "
-                    "or upload/search the exact full font."
+                    "and no embedded resource could supply a geometrically compatible "
+                    "outline after target-weight calibration. Use the database "
+                    "completion option or upload/search the exact full font."
                 )
+                if adaptive_error:
+                    note += " Calibration check: " + adaptive_error
             preview = " ".join(repr(ch) for ch in missing[:12])
             raise ValueError(
                 note + (f" Missing glyphs: {preview}." if preview else "")
@@ -2139,20 +2882,29 @@ class WebEditorSession:
         )
         self.current_resolution = resolution
         self.approved_fallback = {
-            "mode": "pdf_glyph_resource",
+            "mode": fallback_mode,
             "replacement": replacement,
             "token": secrets.token_urlsafe(16),
             "candidate": candidate,
             "resolution": resolution,
         }
         self.match_status = (
-            "✓ GLYPHS FOUND ELSEWHERE IN PDF\n"
+            (
+                "✓ MISSING GLYPHS MATCHED TO TARGET WEIGHT\n"
+                if fallback_mode == "adaptive_pdf_glyph"
+                else "✓ GLYPHS FOUND ELSEWHERE IN PDF\n"
+            )
+            +
             f"Font: {candidate.display_name}\n"
             "No external font file will be added.\n"
             + note
         )
         self.match_tone = "success"
-        self.status = "A verified same-family PDF font subset is ready."
+        self.status = (
+            "Missing glyphs were calibrated to the selected font's existing outline weight."
+            if fallback_mode == "adaptive_pdf_glyph"
+            else "A verified same-family PDF font subset is ready."
+        )
         return resolution
 
     def approve_database_fallback(
@@ -2166,22 +2918,40 @@ class WebEditorSession:
     ):
         if not self.selected_span:
             raise ValueError("Select PDF text first.")
-        if mode not in {"closest_font", "outline"}:
+        if mode not in {"closest_font", "adaptive_font", "outline"}:
             raise ValueError("Unsupported font fallback mode.")
 
         # Keep the resolver's saved/manual candidate immutable. Fallback
         # preparation is approval-specific and must not leak into later edits.
         candidate = copy.copy(candidate)
+        donor_display_name = candidate.display_name
+        donor_weight = int(getattr(candidate, "weight", None) or 400)
 
         family_similarity = float(score.get("family_similarity", 0.0))
         family_exact = family_similarity >= 0.995
+        weight_delta = int(score.get("weight_delta", 9999))
+        italic_match = bool(score.get("italic_match"))
         subset_completion = False
+        compatibility_report = None
+
+        if mode == "closest_font" and (
+            not family_exact
+            or weight_delta > 100
+            or not italic_match
+        ):
+            raise ValueError(
+                "The database font was rejected before editing because it is not "
+                "the same family, weight and style as the selected PDF font "
+                f"(target weight {score.get('target_weight', 'unknown')}, "
+                f"candidate weight {score.get('candidate_weight', 'unknown')}). "
+                "The original PDF was not changed. Upload the exact full font face."
+            )
 
         # Preferred path for the statement-style Type1C PDFs: retain the
         # selected PDF's actual font resource and append only glyph programs
         # that its subset does not already contain. Existing glyphs, byte codes,
         # widths and page resource names remain the original ones.
-        if mode == "closest_font" and family_exact:
+        if mode in {"closest_font", "adaptive_font"}:
             page = self.doc[self.page_index]
             prepared = self.font_resolver._cff_subset_extension_candidate(
                 page,
@@ -2189,7 +2959,44 @@ class WebEditorSession:
                 candidate,
             )
             if getattr(prepared, "extend_original_cff", False):
+                if mode == "adaptive_font":
+                    plan = getattr(prepared, "adaptive_glyph_plan", None) or {}
+                    if not plan:
+                        raise ValueError(
+                            "The database donor has no verified target-weight glyph plan."
+                        )
+                    if int(plan.get("target_font_xref", -1)) != int(
+                        prepared.pdf_xref
+                    ):
+                        raise ValueError(
+                            "The database glyph plan belongs to a different PDF font resource."
+                        )
+                    compatibility_report = {
+                        "ok": True,
+                        "reason": str(plan.get("report") or "").strip(),
+                    }
+                else:
+                    compatibility_report = verify_donor_compatibility(
+                        self.doc,
+                        prepared,
+                        self.selected_span.text,
+                    )
+                    if not compatibility_report.get("ok"):
+                        raise ValueError(
+                            compatibility_report.get("reason")
+                            or "The donor font outline fingerprint does not match the original subset."
+                        )
                 candidate = prepared
+                if mode == "adaptive_font":
+                    target_family, profile_weight, target_italic = (
+                        self.target_font_profile()
+                    )
+                    target_weight = int(
+                        score.get("target_weight", profile_weight) or profile_weight
+                    )
+                    candidate.family = target_family
+                    candidate.weight = target_weight
+                    candidate.italic = target_italic
                 candidate.pdf_unicode_widths = extension_unicode_widths(
                     self.doc,
                     candidate,
@@ -2197,7 +3004,7 @@ class WebEditorSession:
                 )
                 subset_completion = True
 
-        if mode == "closest_font" and not subset_completion:
+        if mode in {"closest_font", "adaptive_font"} and not subset_completion:
             raise ValueError(
                 "The selected PDF font cannot be completed safely in-place from "
                 "this database face. No full-line font substitution was applied. "
@@ -2206,17 +3013,30 @@ class WebEditorSession:
             )
 
         source_label = (
-            "MongoDB donor for original PDF subset completion"
+            "MongoDB glyph donor calibrated to original PDF weight"
+            if mode == "adaptive_font"
+            else "MongoDB donor for original PDF subset completion"
             if subset_completion
             else "MongoDB vector-outline source"
         )
         candidate.source = source_label
-        if subset_completion:
+        if mode == "adaptive_font":
+            source_note = (
+                f"Original PDF Type1C target-weight completion using "
+                f"{donor_display_name} (donor metadata weight {donor_weight}; "
+                f"target weight {candidate.weight}). The donor's shared glyphs were measured "
+                "against the selected subset and only the requested missing outlines "
+                "were emboldened/transformed before being appended. Existing glyphs, "
+                "resource names and byte mappings remain untouched. "
+                + str((compatibility_report or {}).get("reason") or "")
+            )
+        elif subset_completion:
             source_note = (
                 f"Original PDF Type1C subset completion using {candidate.display_name}. "
                 "Only missing glyph programs and their encoding/ToUnicode entries "
                 "will be appended to the original /F# resource; existing glyphs "
-                "remain untouched."
+                "remain untouched. "
+                + str((compatibility_report or {}).get("reason") or "")
             )
         else:
             source_note = (
@@ -2226,9 +3046,9 @@ class WebEditorSession:
         resolution = FontResolution(
             ok=True,
             candidate=candidate,
-            exact_family=family_exact,
-            exact_weight=bool(score.get("weight_delta", 9999) <= 100),
-            exact_style=bool(score.get("italic_match")),
+            exact_family=(True if mode == "adaptive_font" else family_exact),
+            exact_weight=(True if mode == "adaptive_font" else weight_delta <= 100),
+            exact_style=(True if mode == "adaptive_font" else italic_match),
             glyphs_ok=True,
             source_note=source_note,
         )
@@ -2251,6 +3071,21 @@ class WebEditorSession:
             )
             self.status = "Vector-outline fallback approved for this replacement only."
             self.match_tone = "warning"
+        elif mode == "adaptive_font":
+            plan = getattr(candidate, "adaptive_glyph_plan", None) or {}
+            self.match_status = (
+                "✓ MISSING GLYPHS CALIBRATED TO TARGET WEIGHT\n"
+                f"Glyph source: {candidate.display_name}\n"
+                f"Original resource: /{candidate.pdf_refname} "
+                f"(xref {candidate.pdf_xref})\n"
+                + str(plan.get("report") or "")
+                + "\nOnly missing outlines will be added; existing target glyphs stay unchanged."
+            )
+            self.status = (
+                "Database glyphs are calibrated to the selected PDF font's "
+                "measured outline weight."
+            )
+            self.match_tone = "success"
         elif subset_completion:
             self.match_status = (
                 "✓ ORIGINAL PDF SUBSET COMPLETION READY\n"
@@ -2536,6 +3371,15 @@ class WebEditorSession:
                     )
                 )
 
+                # Structural row moves use clipped Form XObjects so existing
+                # subset-font text can be copied exactly.  PyMuPDF redaction
+                # may rename / rewrite those wrappers, which would leave extra
+                # reachable objects at Save As.  Flatten the verified wrappers
+                # inside this Undo transaction before editing a cloned/moved
+                # cell; the PDF text and pixels are checked by the flattener.
+                if self.edit_session:
+                    self.edit_session._inline_line_reflow_forms(self.doc)
+
                 if fallback_mode == "outline":
                     updated_span, outline_bbox = (
                         self.engine.replace_with_outline_reflow(
@@ -2663,6 +3507,7 @@ class WebEditorSession:
                     # cannot accidentally be layered over the existing paths.
                     self.selected_span = None
                     self.selected_line_spans = []
+                    self.selected_row_info = None
                     self.selected_docx_ref = None
                     self.current_resolution = None
 
@@ -2815,6 +3660,9 @@ class WebEditorSession:
                 )
             )
 
+            if self.edit_session:
+                self.edit_session._inline_line_reflow_forms(self.doc)
+
             updated_span = (
                 self.engine
                 .replace_with_multiline_reflow(
@@ -2898,12 +3746,14 @@ class WebEditorSession:
         )
 
         restore_page_index = self.page_index
+        restored_spans = None
         if self.edit_session:
             if isinstance(edit_state, int):
                 self.edit_session.truncate_edits(edit_state)
             elif isinstance(edit_state, dict):
                 self.edit_session.edits = copy.deepcopy(edit_state.get("edits", []))
                 restore_page_index = int(edit_state.get("page_index", self.page_index))
+                restored_spans = copy.deepcopy(edit_state.get("spans"))
             else:
                 self.edit_session.edits = copy.deepcopy(edit_state)
 
@@ -2917,15 +3767,17 @@ class WebEditorSession:
         self.page_index = max(0, min(restore_page_index, len(self.doc) - 1))
 
         self.clear_selection()
-
-        self.refresh_spans()
+        if restored_spans is None:
+            self.refresh_spans()
+        else:
+            self.spans = restored_spans
 
     def undo_last(self):
 
         if not self.undo_stack:
 
             raise ValueError(
-                "There is no replacement "
+                "There is no edit "
                 "to undo."
             )
 
@@ -2934,12 +3786,14 @@ class WebEditorSession:
         )
 
         restore_page_index = self.page_index
+        restored_spans = None
         if self.edit_session:
             if isinstance(edit_state, int):
                 self.edit_session.truncate_edits(edit_state)
             elif isinstance(edit_state, dict):
                 self.edit_session.edits = copy.deepcopy(edit_state.get("edits", []))
                 restore_page_index = int(edit_state.get("page_index", self.page_index))
+                restored_spans = copy.deepcopy(edit_state.get("spans"))
             else:
                 self.edit_session.edits = copy.deepcopy(edit_state)
 
@@ -2953,11 +3807,17 @@ class WebEditorSession:
         self.page_index = max(0, min(restore_page_index, len(self.doc) - 1))
 
         self.clear_selection()
+        if restored_spans is None:
+            self.refresh_spans()
+        else:
+            self.spans = restored_spans
 
-        self.refresh_spans()
+        self.last_output = None
+        self.last_audit = None
+        self.last_validation = None
 
         self.status = (
-            "Last replacement undone."
+            "Last edit undone."
         )
 
     def export(self):
@@ -3319,6 +4179,14 @@ class WebEditorSession:
             self._selection_data(),
             "line_selected":
             bool(self.selected_line_spans),
+            "line_delete_options": {
+                "remove_table_rule_default": False,
+                "move_remaining_table_rules": True,
+            },
+            "row_insert": (
+                self.selected_row_info
+                or self._selected_table_row_info()
+            ),
             "docx":
             self._docx_data(),
             "resolution":
@@ -4075,21 +4943,125 @@ def _prepare_database_fallback(
     if mode == "outline" and not str(req.replacement or "").strip():
         raise ValueError("Vector-outline fallback requires visible replacement text.")
     family, weight, italic = session.target_font_profile()
+
+    def candidate_from_path(path: Path) -> FontCandidate:
+        meta = read_font_metadata_from_path(str(path))
+        if not meta:
+            raise ValueError("Saved font metadata could not be read safely.")
+        return FontCandidate(
+            path=str(path),
+            family=meta.get("family"),
+            subfamily=meta.get("subfamily"),
+            full_name=meta.get("full_name"),
+            postscript=meta.get("postscript"),
+            weight=meta.get("weight"),
+            italic=bool(meta.get("italic")),
+            source="Saved MongoDB font",
+        )
+
+    required_glyphs = str(req.replacement or "")
+    candidate_validator = None
+    accepted_completion: dict[str, dict[str, Any]] = {}
+    if mode == "closest_font":
+        page = session.doc[session.page_index]
+        record = session.font_resolver.find_page_font(page, session.selected_span)
+        if record and int(record.get("xref", 0) or 0) > 0:
+            _already_available, missing, _widths = inspect_existing_cff(
+                session.doc,
+                int(record["xref"]),
+                required_glyphs,
+            )
+            missing_text = "".join(dict.fromkeys(missing))
+            if missing_text:
+                required_glyphs = missing_text
+
+        def candidate_validator(path, _record, _score):
+            proposed = candidate_from_path(path)
+            prepared = session.font_resolver._cff_subset_extension_candidate(
+                page,
+                session.selected_span,
+                proposed,
+            )
+            if not getattr(prepared, "extend_original_cff", False):
+                return False, "The selected PDF font is not safely extendable in place."
+            similarity = float(_score.get("family_similarity", 0.0))
+            candidate_weight = int(_score.get("candidate_weight", 400))
+            target_weight = int(_score.get("target_weight", 400))
+            italic_match = bool(_score.get("italic_match"))
+            if similarity < 0.65:
+                return False, (
+                    "Font family is too different for missing-glyph weight calibration "
+                    f"(similarity {similarity:.3f})."
+                )
+            if not italic_match:
+                return False, "Italic/upright style does not match the selected PDF font."
+
+            report = verify_donor_compatibility(
+                session.doc,
+                prepared,
+                session.selected_span.text,
+            )
+            path_key = str(Path(path).resolve())
+            strict_metadata = bool(
+                float(_score.get("family_similarity", 0.0)) >= 0.995
+                and int(_score.get("weight_delta", 9999)) <= 100
+                and italic_match
+            )
+            if strict_metadata and report.get("ok"):
+                accepted_completion[path_key] = {
+                    "mode": "closest_font",
+                    "report": str(report.get("reason") or ""),
+                }
+                return True, str(report.get("reason") or "")
+
+            if candidate_weight > target_weight:
+                return False, (
+                    "The donor is heavier than the target; this safe path only "
+                    "emboldens compatible lighter outlines."
+                )
+
+            try:
+                plan = build_adaptive_external_glyph_plan(
+                    session.doc,
+                    int(prepared.pdf_xref),
+                    prepared,
+                    required_glyphs,
+                    session.selected_span.text,
+                )
+            except Exception as exc:
+                return False, str(exc)
+            accepted_completion[path_key] = {
+                "mode": "adaptive_font",
+                "plan": plan,
+                "report": str(plan.get("report") or ""),
+            }
+            return True, str(plan.get("report") or "")
+
     path, record, score = _get_font_store().best_compatible_font(
-        replacement=req.replacement,
+        replacement=required_glyphs,
         target_family=family,
         target_weight=weight,
         target_italic=italic,
         destination_dir=session.session_dir,
+        require_exact_face=False,
+        candidate_validator=candidate_validator,
     )
-    candidate = session.font_resolver.add_manual_font(str(path))
+    candidate = candidate_from_path(path)
+    approval_mode = mode
+    completion = accepted_completion.get(str(Path(path).resolve()))
+    if mode == "closest_font" and completion:
+        approval_mode = str(completion.get("mode") or mode)
+        if approval_mode == "adaptive_font":
+            candidate.adaptive_glyph_plan = completion.get("plan")
     session.approve_database_fallback(
         candidate=candidate,
         replacement=req.replacement,
         record=record,
         score=score,
-        mode=mode,
+        mode=approval_mode,
     )
+    score = dict(score)
+    score["completion_mode"] = approval_mode
     return {
         "font": _public_font_record(record),
         "score": score,
@@ -4324,12 +5296,55 @@ def select_full_line(
 )
 def delete_full_line(
     sid: str,
+    req: DeleteLineRequest | None = None,
     user: UserContext = Depends(_require_user),
 ):
     session = _get_session(sid, user)
     try:
         with session.lock:
-            session.delete_selected_line()
+            session.delete_selected_line(
+                remove_table_rule=(
+                    req.remove_table_rule
+                    if req is not None
+                    else False
+                )
+            )
+            return session.state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/{sid}/line/add-row"
+)
+def add_table_row(
+    sid: str,
+    req: InsertTableRowRequest | None = None,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.add_selected_row_below(
+                position=(req.position if req is not None else "below")
+            )
+            return session.state()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/{sid}/table-line/delete"
+)
+def delete_table_line(
+    sid: str,
+    req: PointRequest,
+    user: UserContext = Depends(_require_user),
+):
+    session = _get_session(sid, user)
+    try:
+        with session.lock:
+            session.delete_table_line_at(req.x, req.y)
             return session.state()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

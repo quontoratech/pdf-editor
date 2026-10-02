@@ -1002,8 +1002,15 @@ class FontResolver:
         if int(record.get("xref", 0) or 0) <= 0 or not record.get("refname"):
             return full_candidate
 
-        # The extender currently consumes a real full font file or buffer.
-        if not getattr(full_candidate, "path", None) and not getattr(full_candidate, "embedded_bytes", None):
+        # Exact completion consumes a full font file / buffer. Adaptive PDF
+        # completion instead carries a pre-verified outline plan whose source
+        # is another embedded CFF resource, so it intentionally has no file.
+        adaptive_plan = getattr(full_candidate, "adaptive_glyph_plan", None)
+        if (
+            not getattr(full_candidate, "path", None)
+            and not getattr(full_candidate, "embedded_bytes", None)
+            and not adaptive_plan
+        ):
             return full_candidate
 
         return FontCandidate(
@@ -1021,6 +1028,8 @@ class FontResolver:
             extend_original_cff=True,
             subset_extension_font_path=getattr(full_candidate, "path", None),
             subset_extension_font_bytes=getattr(full_candidate, "embedded_bytes", None),
+            adaptive_glyph_plan=adaptive_plan,
+            pdf_unicode_widths=getattr(full_candidate, "pdf_unicode_widths", None),
         )
 
     @staticmethod

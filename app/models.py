@@ -65,6 +65,12 @@ class FontCandidate:
     subset_extension_font_path: Optional[str] = None
     subset_extension_font_bytes: Optional[bytes] = field(default=None, repr=False)
 
+    # Optional geometry-calibrated donor plan.  This is used when an exact
+    # missing glyph is unavailable but a compatible lighter face contains it.
+    # Existing glyphs in the target CFF remain untouched; only the requested
+    # missing outlines are emboldened / transformed before being appended.
+    adaptive_glyph_plan: Optional[dict] = field(default=None, repr=False)
+
     # Explicit same-family composite assembled from verified PDF resources.
     # Each replacement character maps to the resource that visibly rendered it.
     glyph_candidates: Optional[dict[str, "FontCandidate"]] = field(

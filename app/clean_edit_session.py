@@ -795,6 +795,9 @@ class CleanEditSession:
         deleted_text: str,
         deleted_bbox,
         moved_lines,
+        moved_table_rule_count: int = 0,
+        removed_table_rule_count: int = 0,
+        remove_table_rule: bool = False,
     ) -> None:
         """Record one full-line deletion + upward-reflow transaction.
 
@@ -841,7 +844,14 @@ class CleanEditSession:
                 "page": int(page_number),
                 "deleted_text": str(deleted_text or ""),
                 "deleted_bbox": [float(v) for v in deleted_bbox],
+                "deleted_check_active": True,
                 "moved_lines": normalized_moved,
+                "table_rule_reflow": {
+                    "move_remaining_rules": True,
+                    "remove_deleted_row_rule": bool(remove_table_rule),
+                    "moved_rule_count": int(moved_table_rule_count or 0),
+                    "removed_rule_count": int(removed_table_rule_count or 0),
+                },
                 # record_line_reflow_operation() is called only after PdfEngine
                 # has serialized / reopened the edited document and verified
                 # the moved lines immediately. Keep that fact in the audit data.
@@ -850,12 +860,135 @@ class CleanEditSession:
             }
         )
 
+    def record_table_row_insert_operation(
+        self,
+        *,
+        page_number: int,
+        template_text: str,
+        inserted_bbox,
+        inserted_lines,
+        moved_lines,
+        moved_table_rules=None,
+        inserted_table_rules=None,
+        column_count: int = 0,
+        position: str = "below",
+    ) -> None:
+        """Record one validated template-clone table-row insertion."""
+        normalized_inserted = []
+        normalized_moved = []
+
+        for source, output in (
+            (inserted_lines or [], normalized_inserted),
+            (moved_lines or [], normalized_moved),
+        ):
+            for item in source:
+                bbox = item.get("bbox")
+                if not bbox or len(bbox) < 4:
+                    continue
+                output.append(
+                    {
+                        "text": str(item.get("text") or ""),
+                        "bbox": [float(value) for value in bbox[:4]],
+                        "active": bool(item.get("active", True)),
+                    }
+                )
+
+        # The newly established positions supersede stale structural
+        # expectations left by any preceding line deletion / row insertion.
+        superseding_boxes = [inserted_bbox]
+        superseding_boxes.extend(
+            item["bbox"] for item in normalized_inserted + normalized_moved
+        )
+        self._deactivate_overlapping_line_reflow_expectations(
+            page_number=int(page_number),
+            bboxes=superseding_boxes,
+            reason="superseded by a later table row insertion",
+        )
+
+        self.edits.append(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "operation_type": "table_row_insert",
+                "page": int(page_number),
+                "position": str(position or "below"),
+                "template_text": str(template_text or ""),
+                "column_count": int(column_count or len(normalized_inserted)),
+                "inserted_bbox": [float(value) for value in inserted_bbox],
+                "inserted_lines": normalized_inserted,
+                "moved_lines": normalized_moved,
+                "moved_table_rules": list(moved_table_rules or []),
+                "inserted_table_rules": list(inserted_table_rules or []),
+                "immediate_validation_passed": True,
+                "edit_mode": "clean-table-row-template-clone",
+            }
+        )
+
+    def record_table_rule_delete_operation(
+        self,
+        *,
+        page_number: int,
+        bbox,
+        rule,
+        click=None,
+    ) -> None:
+        """Record a validated graphics-only deletion of one table rule."""
+        if not bbox or len(bbox) < 4:
+            raise ValueError("A table-rule audit record requires a PDF bbox.")
+
+        rule = dict(rule or {})
+        normalized_rule = {
+            "x0": float(rule.get("x0", bbox[0])),
+            "x1": float(rule.get("x1", bbox[2])),
+            "y": float(
+                rule.get(
+                    "y",
+                    (float(bbox[1]) + float(bbox[3])) / 2.0,
+                )
+            ),
+            "width": float(rule.get("width") or 0.0),
+            "color": [
+                float(value)
+                for value in (rule.get("color") or [])
+            ],
+            "dashes": rule.get("dashes"),
+            "line_cap": int(rule.get("line_cap") or 0),
+            "line_join": int(rule.get("line_join") or 0),
+            "stroke_opacity": float(
+                rule.get("stroke_opacity")
+                if rule.get("stroke_opacity") is not None
+                else 1.0
+            ),
+        }
+
+        self.edits.append(
+            {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "operation_type": "table_rule_delete",
+                "page": int(page_number),
+                "bbox": [float(value) for value in bbox[:4]],
+                "rule": normalized_rule,
+                "click": (
+                    [float(click[0]), float(click[1])]
+                    if click and len(click) >= 2
+                    else None
+                ),
+                "immediate_validation_passed": True,
+                "edit_mode": "clean-horizontal-table-rule-delete",
+            }
+        )
+
     def shift_for_page_insert(self, inserted_page_number: int) -> None:
         """Shift active text / line-reflow page numbers after page insertion."""
         inserted_page_number = int(inserted_page_number)
 
         for edit in self.edits:
-            if edit.get("operation_type", "text") not in {"text", "outline", "line_reflow"}:
+            if edit.get("operation_type", "text") not in {
+                "text",
+                "outline",
+                "line_reflow",
+                "table_rule_delete",
+                "table_row_insert",
+            }:
                 continue
             if edit.get("inactive"):
                 continue
@@ -867,7 +1000,13 @@ class CleanEditSession:
         deleted_page_number = int(deleted_page_number)
 
         for edit in self.edits:
-            if edit.get("operation_type", "text") not in {"text", "outline", "line_reflow"}:
+            if edit.get("operation_type", "text") not in {
+                "text",
+                "outline",
+                "line_reflow",
+                "table_rule_delete",
+                "table_row_insert",
+            }:
                 continue
             if edit.get("inactive"):
                 continue
@@ -924,51 +1063,83 @@ class CleanEditSession:
         for edit in self.edits:
             if edit.get("inactive"):
                 continue
-            if edit.get("operation_type", "text") != "line_reflow":
+            operation_type = edit.get("operation_type", "text")
+            if operation_type not in {"line_reflow", "table_row_insert"}:
                 continue
             if int(edit.get("page", 0) or 0) != page_number:
                 continue
 
-            for moved in edit.get("moved_lines", []):
-                if not moved.get("active", True):
-                    continue
+            # A later authoritative edit may intentionally put content back in
+            # a slot that an earlier line-reflow emptied (for example: clone a
+            # row, delete that clone, then clone it again). The earlier delete
+            # passed a serialized/reopened absence check when it happened, but
+            # its old slot is no longer required to stay empty forever. Retire
+            # only that stale final absence expectation; keep the operation and
+            # its remaining moved-line audit data intact.
+            if (
+                operation_type == "line_reflow"
+                and edit.get("deleted_check_active", True)
+            ):
+                deleted_bbox = edit.get("deleted_bbox")
+                if deleted_bbox and any(
+                    self._bbox_overlap_ratio(deleted_bbox, box) >= 0.20
+                    for box in valid_boxes
+                ):
+                    edit["deleted_check_active"] = False
+                    edit["deleted_check_inactive_reason"] = str(reason)
 
-                moved_bbox = moved.get("bbox")
-                if not moved_bbox:
-                    continue
+            expectation_groups = [edit.get("moved_lines", [])]
+            if operation_type == "table_row_insert":
+                expectation_groups.append(edit.get("inserted_lines", []))
 
-                touched = False
-                for box in valid_boxes:
-                    # 20% overlap is enough here because a later edit may touch
-                    # only one span / phrase inside a longer moved visual line.
-                    if self._bbox_overlap_ratio(moved_bbox, box) >= 0.20:
-                        touched = True
-                        break
+            for expectations in expectation_groups:
+                for moved in expectations:
+                    if not moved.get("active", True):
+                        continue
 
-                    # Also accept center-point containment for very thin PDF
-                    # spans where area-overlap ratios can be misleading.
-                    try:
-                        mr = pymupdf.Rect(*[float(v) for v in moved_bbox])
-                        br = pymupdf.Rect(*[float(v) for v in box])
-                        center = pymupdf.Point(
-                            (float(br.x0) + float(br.x1)) / 2.0,
-                            (float(br.y0) + float(br.y1)) / 2.0,
-                        )
-                        expanded = pymupdf.Rect(
-                            float(mr.x0) - 3.0,
-                            float(mr.y0) - 3.0,
-                            float(mr.x1) + 3.0,
-                            float(mr.y1) + 3.0,
-                        )
-                        if center in expanded:
+                    moved_bbox = moved.get("bbox")
+                    if not moved_bbox:
+                        continue
+
+                    touched = False
+                    for box in valid_boxes:
+                        # 20% overlap is enough here because a later edit may touch
+                        # only one span / phrase inside a longer moved visual line.
+                        if self._bbox_overlap_ratio(moved_bbox, box) >= 0.20:
                             touched = True
                             break
-                    except Exception:
-                        pass
 
-                if touched:
-                    moved["active"] = False
-                    moved["inactive_reason"] = str(reason)
+                        # Also accept center-point containment for very thin PDF
+                        # spans where area-overlap ratios can be misleading.
+                        try:
+                            mr = pymupdf.Rect(*[float(v) for v in moved_bbox])
+                            br = pymupdf.Rect(*[float(v) for v in box])
+                            center = pymupdf.Point(
+                                (float(br.x0) + float(br.x1)) / 2.0,
+                                (float(br.y0) + float(br.y1)) / 2.0,
+                            )
+                            expanded = pymupdf.Rect(
+                                float(mr.x0) - 3.0,
+                                float(mr.y0) - 3.0,
+                                float(mr.x1) + 3.0,
+                                float(mr.y1) + 3.0,
+                            )
+                            if center in expanded:
+                                touched = True
+                                break
+                        except Exception:
+                            pass
+
+                    if touched:
+                        moved["active"] = False
+                        moved["inactive_reason"] = str(reason)
+
+    @staticmethod
+    def _structural_expectation_groups(edit):
+        groups = [edit.get("moved_lines", [])]
+        if edit.get("operation_type") == "table_row_insert":
+            groups.append(edit.get("inserted_lines", []))
+        return groups
 
     def deactivate_for_line_delete(self, page_number: int, deleted_bbox) -> None:
         """Deactivate earlier final-state content that is removed by a later line deletion."""
@@ -991,13 +1162,14 @@ class CleanEditSession:
                     edit["inactive"] = True
                     edit["inactive_reason"] = "text line deleted"
 
-            elif op_type == "line_reflow":
-                for moved in edit.get("moved_lines", []):
-                    if not moved.get("active", True):
-                        continue
-                    bbox = moved.get("bbox")
-                    if bbox and self._bbox_overlap_ratio(bbox, deleted_bbox) >= 0.50:
-                        moved["active"] = False
+            elif op_type in {"line_reflow", "table_row_insert"}:
+                for expectations in self._structural_expectation_groups(edit):
+                    for moved in expectations:
+                        if not moved.get("active", True):
+                            continue
+                        bbox = moved.get("bbox")
+                        if bbox and self._bbox_overlap_ratio(bbox, deleted_bbox) >= 0.50:
+                            moved["active"] = False
 
     def shift_for_line_reflow(self, page_number: int, source_bboxes, dy: float) -> None:
         """
@@ -1046,29 +1218,39 @@ class CleanEditSession:
                         float(origin[1]) + dy,
                     ]
 
-            elif op_type == "line_reflow":
-                for moved in edit.get("moved_lines", []):
-                    if not moved.get("active", True):
-                        continue
+            elif op_type in {"line_reflow", "table_row_insert"}:
+                for expectations in self._structural_expectation_groups(edit):
+                    for moved in expectations:
+                        if not moved.get("active", True):
+                            continue
 
-                    bbox = moved.get("bbox")
-                    if not bbox:
-                        continue
+                        bbox = moved.get("bbox")
+                        if not bbox:
+                            continue
 
-                    should_shift = any(
-                        self._bbox_overlap_ratio(bbox, box) >= 0.50
-                        for box in boxes
-                    )
+                        should_shift = any(
+                            self._bbox_overlap_ratio(bbox, box) >= 0.50
+                            for box in boxes
+                        )
 
-                    if not should_shift:
-                        continue
+                        if not should_shift:
+                            continue
 
-                    moved["bbox"] = [
-                        float(bbox[0]),
-                        float(bbox[1]) + dy,
-                        float(bbox[2]),
-                        float(bbox[3]) + dy,
-                    ]
+                        moved["bbox"] = [
+                            float(bbox[0]),
+                            float(bbox[1]) + dy,
+                            float(bbox[2]),
+                            float(bbox[3]) + dy,
+                        ]
+
+    def shift_for_table_row_insert(
+        self,
+        page_number: int,
+        source_bboxes,
+        dy: float,
+    ) -> None:
+        """Move prior final-state expectations with a downward row insertion."""
+        self.shift_for_line_reflow(page_number, source_bboxes, dy)
 
     def _restore_source_identity(self, doc) -> list[str]:
         """Undo incidental identity mutations made by earlier PyMuPDF probes.
@@ -1651,6 +1833,255 @@ class CleanEditSession:
                     )
                     continue
 
+                if operation_type == "table_rule_delete":
+                    pno = int(edit.get("page", 0) or 0)
+
+                    if pno < 1 or pno > len(doc):
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | Table-rule deletion "
+                            "validation failed | Issue: target page no longer exists."
+                        )
+                        checks.append(
+                            {
+                                "edit": idx,
+                                "page": pno,
+                                "operation_type": "table_rule_delete",
+                                "passed": False,
+                                "reason": "target page no longer exists",
+                            }
+                        )
+                        continue
+
+                    page = doc[pno - 1]
+                    rule = dict(edit.get("rule") or {})
+                    expected_x0 = float(rule.get("x0", 0.0))
+                    expected_x1 = float(rule.get("x1", 0.0))
+                    expected_y = float(rule.get("y", 0.0))
+                    expected_width = max(
+                        0.01,
+                        float(rule.get("width") or 0.0),
+                    )
+                    # A close surviving double rule must not be mistaken for
+                    # the exact path that was deliberately deleted.
+                    tolerance = max(
+                        0.08,
+                        min(0.25, expected_width * 0.50),
+                    )
+                    matching_rules = []
+
+                    try:
+                        drawings = page.get_drawings(extended=True)
+                    except TypeError:
+                        drawings = page.get_drawings()
+                    except Exception:
+                        drawings = []
+
+                    for drawing in drawings or []:
+                        try:
+                            drawing_level = max(
+                                0,
+                                int(drawing.get("level") or 0),
+                            )
+                        except (TypeError, ValueError):
+                            drawing_level = 0
+                        if drawing_level > 1:
+                            continue
+                        drawing_type = str(drawing.get("type") or "")
+                        items = list(drawing.get("items") or [])
+                        if "s" not in drawing_type or len(items) != 1:
+                            continue
+                        item = items[0]
+                        if not item or item[0] != "l" or len(item) < 3:
+                            continue
+                        try:
+                            p1 = pymupdf.Point(item[1])
+                            p2 = pymupdf.Point(item[2])
+                        except Exception:
+                            continue
+                        if abs(float(p1.y) - float(p2.y)) > tolerance:
+                            continue
+                        observed_x0 = min(float(p1.x), float(p2.x))
+                        observed_x1 = max(float(p1.x), float(p2.x))
+                        observed_y = (float(p1.y) + float(p2.y)) / 2.0
+                        if (
+                            abs(observed_y - expected_y) <= tolerance
+                            and abs(observed_x0 - expected_x0) <= 0.75
+                            and abs(observed_x1 - expected_x1) <= 0.75
+                        ):
+                            matching_rules.append(
+                                [
+                                    observed_x0,
+                                    observed_y,
+                                    observed_x1,
+                                    observed_y,
+                                ]
+                            )
+
+                    immediate_ok = bool(
+                        edit.get("immediate_validation_passed", False)
+                    )
+                    passed = not matching_rules and immediate_ok
+                    checks.append(
+                        {
+                            "edit": idx,
+                            "page": pno,
+                            "operation_type": "table_rule_delete",
+                            "bbox": [float(value) for value in edit.get("bbox", [])],
+                            "matching_rules_at_deleted_position": len(matching_rules),
+                            "immediate_validation_passed": immediate_ok,
+                            "passed": passed,
+                        }
+                    )
+                    if not passed:
+                        reasons = []
+                        if matching_rules:
+                            reasons.append(
+                                "the deleted horizontal table rule is present again"
+                            )
+                        if not immediate_ok:
+                            reasons.append(
+                                "the immediate serialized/reopened validation did not pass"
+                            )
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | Table-rule deletion "
+                            f"validation failed | Issue: {'; '.join(reasons)}."
+                        )
+                    continue
+
+                if operation_type == "table_row_insert":
+                    pno = int(edit.get("page", 0) or 0)
+                    if pno < 1 or pno > len(doc):
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | Table-row insertion "
+                            "validation failed | Issue: target page no longer exists."
+                        )
+                        checks.append(
+                            {
+                                "edit": idx,
+                                "page": pno,
+                                "operation_type": "table_row_insert",
+                                "passed": False,
+                                "reason": "target page no longer exists",
+                            }
+                        )
+                        continue
+
+                    page = doc[pno - 1]
+                    inserted_checks = []
+                    inserted_ok = True
+                    for inserted in edit.get("inserted_lines", []):
+                        if not inserted.get("active", True):
+                            continue
+                        bbox = inserted.get("bbox")
+                        expected = str(inserted.get("text") or "")
+                        if not bbox or len(bbox) < 4:
+                            inserted_ok = False
+                            inserted_checks.append(
+                                {
+                                    "text": expected,
+                                    "present": False,
+                                    "validation_method": "missing-final-bbox",
+                                }
+                            )
+                            continue
+                        present, method, observed_bbox = _moved_text_at_final_position(
+                            pno,
+                            page,
+                            expected,
+                            bbox,
+                        )
+                        inserted_checks.append(
+                            {
+                                "text": expected,
+                                "bbox": [float(value) for value in bbox[:4]],
+                                "present": bool(present),
+                                "validation_method": method,
+                                "observed_bbox": observed_bbox,
+                            }
+                        )
+                        if not present:
+                            inserted_ok = False
+
+                    moved_checks = []
+                    moved_ok = True
+                    for moved in edit.get("moved_lines", []):
+                        if not moved.get("active", True):
+                            continue
+                        bbox = moved.get("bbox")
+                        expected = str(moved.get("text") or "")
+                        if not bbox or len(bbox) < 4:
+                            moved_ok = False
+                            moved_checks.append(
+                                {
+                                    "text": expected,
+                                    "present": False,
+                                    "validation_method": "missing-final-bbox",
+                                }
+                            )
+                            continue
+                        present, method, observed_bbox = _moved_text_at_final_position(
+                            pno,
+                            page,
+                            expected,
+                            bbox,
+                        )
+                        moved_checks.append(
+                            {
+                                "text": expected,
+                                "bbox": [float(value) for value in bbox[:4]],
+                                "present": bool(present),
+                                "validation_method": method,
+                                "observed_bbox": observed_bbox,
+                            }
+                        )
+                        if not present:
+                            moved_ok = False
+
+                    immediate_ok = bool(
+                        edit.get("immediate_validation_passed", False)
+                    )
+                    # The inserted row itself is a required final-state result.
+                    # Later edits deactivate only the affected cell expectation.
+                    # Moved lines follow the established reflow rule: their
+                    # immediate serialized/reopened check remains authoritative
+                    # if a later structural edit changes their extraction.
+                    passed = bool(
+                        inserted_ok
+                        and (moved_ok or immediate_ok)
+                        and immediate_ok
+                    )
+                    checks.append(
+                        {
+                            "edit": idx,
+                            "page": pno,
+                            "operation_type": "table_row_insert",
+                            "column_count": int(edit.get("column_count", 0) or 0),
+                            "inserted_lines": inserted_checks,
+                            "moved_lines": moved_checks,
+                            "immediate_validation_passed": immediate_ok,
+                            "passed": passed,
+                        }
+                    )
+                    if not passed:
+                        reasons = []
+                        if not inserted_ok:
+                            reasons.append(
+                                "one or more cloned table cells are missing"
+                            )
+                        if not moved_ok and not immediate_ok:
+                            reasons.append(
+                                "moved following content could not be verified"
+                            )
+                        if not immediate_ok:
+                            reasons.append(
+                                "the immediate serialized/reopened validation did not pass"
+                            )
+                        failures.append(
+                            f"Edit {idx} | Page {pno} | Table-row insertion "
+                            f"validation failed | Issue: {'; '.join(reasons)}."
+                        )
+                    continue
+
                 if operation_type == "line_reflow":
                     pno = int(edit.get("page", 0) or 0)
 
@@ -1674,7 +2105,15 @@ class CleanEditSession:
 
                     deleted_bbox = edit.get("deleted_bbox") or [0, 0, 0, 0]
                     deleted_base_rect = _rect(deleted_bbox) & page.rect
-                    deleted_ypad = max(5.0, float(deleted_base_rect.height) * 1.2)
+                    # Keep the final absence probe inside this row's visual
+                    # slot.  A template-cloned adjacent row may contain the
+                    # exact same text; the previous 1.2x-height padding could
+                    # overlap that legitimate neighbour by a few points and
+                    # falsely report the deleted row as present.
+                    deleted_ypad = max(
+                        3.0,
+                        min(6.0, float(deleted_base_rect.height) * 0.65),
+                    )
                     deleted_rect = pymupdf.Rect(
                         max(float(page.rect.x0), float(deleted_base_rect.x0) - 6.0),
                         max(float(page.rect.y0), float(deleted_base_rect.y0) - deleted_ypad),
@@ -1707,6 +2146,51 @@ class CleanEditSession:
                             pass
 
                     deleted_absent = not deleted_present and not deleted_search_hits
+
+                    # Deleting the original row directly above an identical
+                    # cloned row intentionally moves the same visible/searchable
+                    # text into this slot. Treat that as a replacement, not as
+                    # proof that the deleted source survived. Final-state
+                    # validation below still requires every planned successor
+                    # cell and rejects duplicate local copies.
+                    slot_successors = []
+                    for moved in edit.get("moved_lines", []):
+                        if not moved.get("active", True):
+                            continue
+                        bbox = moved.get("bbox")
+                        if not bbox or len(bbox) < 4:
+                            continue
+                        moved_rect = _rect(bbox)
+                        intersection = moved_rect & deleted_base_rect
+                        if intersection.is_empty:
+                            continue
+                        overlap_height = max(0.0, float(intersection.height))
+                        minimum_height = max(
+                            0.01,
+                            min(
+                                float(moved_rect.height),
+                                float(deleted_base_rect.height),
+                            ),
+                        )
+                        if overlap_height / minimum_height >= 0.50:
+                            slot_successors.append(moved)
+
+                    slot_successors.sort(
+                        key=lambda item: (
+                            float(item["bbox"][0]),
+                            float(item["bbox"][1]),
+                        )
+                    )
+                    slot_successor_text = " ".join(
+                        str(item.get("text") or "").strip()
+                        for item in slot_successors
+                        if str(item.get("text") or "").strip()
+                    ).strip()
+                    identical_successor_expected = bool(
+                        _compact_flexible(deleted_text)
+                        and _compact_flexible(slot_successor_text)
+                        == _compact_flexible(deleted_text)
+                    )
 
                     moved_checks = []
                     moved_ok = True
@@ -1749,6 +2233,48 @@ class CleanEditSession:
                         if not present:
                             moved_ok = False
 
+                    slot_successor_checks = []
+                    for item in moved_checks:
+                        bbox = item.get("bbox")
+                        if not bbox or len(bbox) < 4:
+                            continue
+                        moved_rect = _rect(bbox)
+                        intersection = moved_rect & deleted_base_rect
+                        if intersection.is_empty:
+                            continue
+                        overlap_height = max(0.0, float(intersection.height))
+                        minimum_height = max(
+                            0.01,
+                            min(
+                                float(moved_rect.height),
+                                float(deleted_base_rect.height),
+                            ),
+                        )
+                        if overlap_height / minimum_height >= 0.50:
+                            slot_successor_checks.append(item)
+
+                    expected_local_counts = {}
+                    for item in slot_successors:
+                        value = _compact_flexible(item.get("text") or "")
+                        if value:
+                            expected_local_counts[value] = (
+                                expected_local_counts.get(value, 0) + 1
+                            )
+                    deleted_region_compact = _compact_flexible(deleted_region)
+                    successor_multiplicity_ok = all(
+                        deleted_region_compact.count(value) <= expected_count
+                        for value, expected_count in expected_local_counts.items()
+                    )
+                    identical_successor_verified = bool(
+                        identical_successor_expected
+                        and slot_successor_checks
+                        and all(
+                            bool(item.get("present"))
+                            for item in slot_successor_checks
+                        )
+                        and successor_multiplicity_ok
+                    )
+
                     immediate_ok = bool(
                         edit.get("immediate_validation_passed", False)
                     )
@@ -1777,8 +2303,16 @@ class CleanEditSession:
                         or immediate_ok
                     )
 
+                    deleted_check_active = bool(
+                        edit.get("deleted_check_active", True)
+                    )
+                    deleted_requirement_passed = bool(
+                        not deleted_check_active
+                        or deleted_absent
+                        or identical_successor_verified
+                    )
                     passed = (
-                        deleted_absent
+                        deleted_requirement_passed
                         and moved_requirement_passed
                     )
 
@@ -1788,7 +2322,18 @@ class CleanEditSession:
                             "page": pno,
                             "operation_type": "line_reflow",
                             "immediate_validation_passed": immediate_ok,
+                            "deleted_check_active": deleted_check_active,
+                            "deleted_check_inactive_reason": edit.get(
+                                "deleted_check_inactive_reason",
+                                "",
+                            ),
                             "deleted_text_absent": deleted_absent,
+                            "identical_successor_expected_in_deleted_slot": (
+                                identical_successor_expected
+                            ),
+                            "identical_successor_verified_in_deleted_slot": (
+                                identical_successor_verified
+                            ),
                             "deleted_search_hits_in_old_position": len(deleted_search_hits),
                             "moved_lines": moved_checks,
                             "moved_line_final_recheck_warning": moved_recheck_warning,
@@ -1799,7 +2344,7 @@ class CleanEditSession:
                     if not passed:
                         reasons = []
 
-                        if not deleted_absent:
+                        if not deleted_requirement_passed:
                             reasons.append(
                                 "deleted full line is still searchable at its old position"
                             )
@@ -2143,6 +2688,8 @@ class CleanEditSession:
                 "text",
                 "outline",
                 "line_reflow",
+                "table_rule_delete",
+                "table_row_insert",
             }:
                 continue
             try:
@@ -2269,7 +2816,10 @@ class CleanEditSession:
             int(edit.get("page", 0) or 0)
             for edit in self.edits
             if not edit.get("inactive")
-            and edit.get("operation_type") == "line_reflow"
+            and edit.get("operation_type") in {
+                "line_reflow",
+                "table_row_insert",
+            }
         }
         results: list[dict] = []
         resource_categories = (
@@ -2286,9 +2836,6 @@ class CleanEditSession:
             if not 1 <= page_number <= len(doc):
                 continue
             page = doc[page_number - 1]
-            before_pixmap = page.get_pixmap(alpha=False)
-            before_samples = bytes(before_pixmap.samples)
-            before_text = page.get_text("text")
             wrappers: dict[str, dict] = {}
             resources_transferred: set[tuple[str, str]] = set()
 
@@ -2377,6 +2924,14 @@ class CleanEditSession:
 
             if not wrappers:
                 continue
+
+            # Rendering and text extraction are the expensive verification
+            # steps.  Do them only when generated wrappers actually exist;
+            # later ordinary text edits on an already-flattened page should
+            # not pay this cost again.
+            before_pixmap = page.get_pixmap(alpha=False)
+            before_samples = bytes(before_pixmap.samples)
+            before_text = page.get_text("text")
 
             replacements = 0
             for content_xref in page.get_contents():
@@ -2810,6 +3365,8 @@ class CleanEditSession:
                 "text",
                 "outline",
                 "line_reflow",
+                "table_rule_delete",
+                "table_row_insert",
             }
             for edit in self.edits
         )
@@ -2821,7 +3378,10 @@ class CleanEditSession:
         xref_stream_rewrite: dict | None = None
         has_active_line_reflow = any(
             not edit.get("inactive")
-            and edit.get("operation_type") == "line_reflow"
+            and edit.get("operation_type") in {
+                "line_reflow",
+                "table_row_insert",
+            }
             for edit in self.edits
         )
         garbage_level = 4 if has_active_line_reflow else 2

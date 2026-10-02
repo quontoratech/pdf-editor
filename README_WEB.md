@@ -42,14 +42,31 @@ PDF_EDITOR_PORT=9000 python main.py
 - Load DOCX reference
 - Upload an exact TTF/OTF font and persist it in the MongoDB font library
 - Find verified same-family glyphs in one or more subsets elsewhere in the PDF
-- Complete an original Type1C/CFF subset from an exact-family MongoDB glyph donor
+- Complete an original Type1C/CFF subset from PDF or MongoDB glyph donors, with measured target-weight calibration
 - Convert missing-glyph replacements to audited vector outlines
 - Re-check exact font match
 - Clean text replacement using the existing `PdfEngine`
 - Horizontal and multiline reflow using the existing engine
+- Full-row deletion that moves independent horizontal table rules with the remaining rows
+- **Add Full Row Below** clones a selected table row as an exact template; 2, 3, 4, 5, or more columns are detected automatically and retain their original widths, alignment, searchable text, font resources, and separator style
+- Standalone **Delete Table Line** mode for removing safe horizontal rules after their text is already gone
 - Undo last replacement
 - Save/export PDF using the existing `CleanEditSession`
 - Download audit and validation JSON sidecars
+
+To insert a row, click any cell in the row whose layout should be reused, choose
+**Select Full Line**, then choose **Add Full Row Below**. The button shows the
+detected column count. The cloned cells deliberately start with the template
+values so their exact embedded/subset-font content remains selectable; click
+each cloned cell and use the normal clean replacement workflow to enter the new
+values. Later rows and safe horizontal rules move down by the table's measured
+row height. A fixed footer or later unrelated section is not moved.
+
+Structural row edits keep a validated in-memory hit-test index instead of
+recursively rebuilding a text dictionary through every clipped full-page Form.
+This removes the multi-minute **Deleting full text line…** wait seen on smaller
+VPS CPUs while preserving the same immediate searchable-text and final PDF
+structure checks.
 - Browser full-screen mode
 
 Vector-outline fallback is intentionally non-searchable and non-selectable. It
@@ -61,6 +78,20 @@ structure-preservation checks.
 For embedded Type1C/CFF fonts, an exact-family MongoDB donor is not substituted
 for the whole line. The editor appends only glyph programs missing from the
 original subset and writes the replacement through that original `/F#` resource.
+Before changing the font stream, an exact donor must pass an outline fingerprint
+against glyphs already present in the original subset. If an exact missing glyph
+is unavailable, a compatible lighter donor from another embedded PDF CFF or the
+font database can be calibrated against at least eight shared target glyphs.
+FreeType emboldens only the missing outline, while measured scale, position,
+shape moments, ink density and advance-width mapping make it match the target
+subset's actual geometry (for example, a 700-weight target). Donors outside the
+strict geometry thresholds are rejected before PDF mutation. Existing target
+glyph programs are never redrawn, and glyphs already present but not yet encoded
+use their intrinsic CFF advance widths rather than widths borrowed from a donor.
+When no safe donor exists, obtain the licensed full TTF/OTF for the exact face
+and weight, upload it with **Upload Exact Font**, and run **Re-check Font Match**.
+The file must contain the reported missing glyphs and pass the embedded-subset
+outline fingerprint; renaming a similar font does not make it compatible.
 The explicit OpenAI exact-font search follows the same path when it finds and
 license-verifies the correct full face; OpenAI is not used to invent arbitrary
 font outlines.
@@ -71,7 +102,7 @@ Recommended Ubuntu setup:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-venv nginx
+sudo apt install -y python3 python3-venv libfreetype6 nginx
 cd /var/www/pdf_text
 python3 -m venv .venv
 source .venv/bin/activate
