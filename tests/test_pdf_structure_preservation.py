@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import tempfile
+import zlib
 from pathlib import Path
 
 import pymupdf
@@ -59,6 +60,123 @@ def make_source(path: Path, *, xref_stream: bool) -> None:
     # not leave an uncompressed redaction stream plus a compressed overlay.
     doc.save(path, deflate=True, use_objstms=1 if xref_stream else 0)
     doc.close()
+
+
+def make_direct_xref_source(path: Path) -> None:
+    """Create a minimal direct-object source with tail content/identity slots."""
+    streams = {
+        5: zlib.compress(b"BT /tiro 11 Tf 50 220 Td (Original line) Tj ET\n"),
+        6: zlib.compress(b"BT /tiro 11 Tf 50 220 Td (Untouched line) Tj ET\n"),
+    }
+    objects = {
+        1: b"<</Type/Pages/Count 2/Kids[2 0 R 3 0 R]>>",
+        2: (
+            b"<</Type/Page/Parent 1 0 R/MediaBox[0 0 400 300]"
+            b"/Resources<</Font<</tiro 4 0 R>>>>/Contents 5 0 R>>"
+        ),
+        3: (
+            b"<</Type/Page/Parent 1 0 R/MediaBox[0 0 400 300]"
+            b"/Resources<</Font<</tiro 4 0 R>>>>/Contents 6 0 R>>"
+        ),
+        4: b"<</Type/Font/Subtype/Type1/BaseFont/Times-Roman/Encoding/WinAnsiEncoding>>",
+        5: (
+            f"<</Length {len(streams[5])}/Filter/FlateDecode>>\nstream\n".encode()
+            + streams[5]
+            + b"\nendstream"
+        ),
+        6: (
+            f"<</Length {len(streams[6])}/Filter/FlateDecode>>\nstream\n".encode()
+            + streams[6]
+            + b"\nendstream"
+        ),
+        7: b"<</Title(Structure Test)/Author(Original Author)/Producer(Original Producer)>>",
+        8: b"<</Pages 1 0 R/Type/Catalog>>",
+    }
+    body = bytearray(b"%PDF-1.7\n%\xC2\xB5\xC2\xB6\n")
+    offsets = {0: 0}
+    for number in range(1, 9):
+        offsets[number] = len(body)
+        body.extend(f"{number} 0 obj\n".encode())
+        body.extend(objects[number])
+        body.extend(b"\nendobj\n")
+    offsets[9] = len(body)
+    decoded = bytearray()
+    for number in range(10):
+        kind = 0 if number == 0 else 1
+        generation = 255 if number == 0 else 0
+        decoded.extend(bytes((kind,)))
+        decoded.extend(int(offsets.get(number, 0)).to_bytes(4, "big"))
+        decoded.extend(bytes((generation,)))
+    compressed = zlib.compress(bytes(decoded))
+    body.extend(
+        b"9 0 obj\n"
+        + (
+            f"<</Size 10/Info 7 0 R/Root 8 0 R/W[1 4 1]/Type/XRef"
+            f"/Filter/FlateDecode/Length {len(compressed)}>>\nstream\n"
+        ).encode()
+        + compressed
+        + b"\nendstream\nendobj\n\n"
+        + f"startxref\n{offsets[9]}\n%%EOF\n".encode()
+    )
+    path.write_bytes(body)
+    check = pymupdf.open(path)
+    try:
+        assert check.page_count == 2
+        assert check[0].get_text().strip() == "Original line"
+        assert CleanEditSession._xref_format(check) == "stream"
+    finally:
+        check.close()
+
+
+def make_compact_classic_edit(path: Path) -> None:
+    """Stage the same file after replacing object 5 with new object 8."""
+    untouched = zlib.compress(
+        b"BT /tiro 11 Tf 50 220 Td (Untouched line) Tj ET\n"
+    )
+    changed = zlib.compress(
+        b"BT /tiro 11 Tf 50 220 Td (Changed line) Tj ET\n"
+    )
+    objects = {
+        1: b"<</Type/Pages/Count 2/Kids[2 0 R 3 0 R]>>",
+        2: (
+            b"<</Type/Page/Parent 1 0 R/MediaBox[0 0 400 300]"
+            b"/Resources<</Font<</tiro 4 0 R>>>>/Contents 8 0 R>>"
+        ),
+        3: (
+            b"<</Type/Page/Parent 1 0 R/MediaBox[0 0 400 300]"
+            b"/Resources<</Font<</tiro 4 0 R>>>>/Contents 5 0 R>>"
+        ),
+        4: b"<</Type/Font/Subtype/Type1/BaseFont/Times-Roman/Encoding/WinAnsiEncoding>>",
+        5: (
+            f"<</Length {len(untouched)}/Filter/FlateDecode>>\nstream\n".encode()
+            + untouched
+            + b"\nendstream"
+        ),
+        6: b"<</Title(Structure Test)/Author(Original Author)/Producer(Original Producer)>>",
+        7: b"<</Pages 1 0 R/Type/Catalog>>",
+        8: (
+            f"<</Length {len(changed)}/Filter/FlateDecode>>\nstream\n".encode()
+            + changed
+            + b"\nendstream"
+        ),
+    }
+    body = bytearray(b"%PDF-1.7\n%\xC2\xB5\xC2\xB6\n")
+    offsets = {0: 0}
+    for number in range(1, 9):
+        offsets[number] = len(body)
+        body.extend(f"{number} 0 obj\n".encode())
+        body.extend(objects[number])
+        body.extend(b"\nendobj\n")
+    xref_offset = len(body)
+    body.extend(b"xref\n0 9\n")
+    body.extend(b"0000000000 65535 f \n")
+    for number in range(1, 9):
+        body.extend(f"{offsets[number]:010d} 00000 n \n".encode())
+    body.extend(
+        b"trailer\n<</Size 9/Info 6 0 R/Root 7 0 R>>\n"
+        + f"startxref\n{xref_offset}\n%%EOF\n".encode()
+    )
+    path.write_bytes(body)
 
 
 def put_pages_before_type_in_catalog(path: Path) -> None:
@@ -229,6 +347,51 @@ def main():
             make_source(source, xref_stream=xref_stream)
             _, (_, _, report) = edit_and_export(source, output)
             assert_preserved(source, output, Path(report), expected_format)
+
+        # A compressed xref stream with direct objects (no /ObjStm) must keep
+        # every existing object number. New edited page streams reuse the old
+        # content slots, and an absent optional /Index stays absent.
+        source = root / "source-direct-xref-stream.pdf"
+        output = root / "output-direct-xref-stream.pdf"
+        make_direct_xref_source(source)
+        make_compact_classic_edit(output)
+        direct_session = CleanEditSession(str(source))
+        direct_session.edits.append(
+            {
+                "page": 1,
+                "operation_type": "text",
+                "inactive": False,
+            }
+        )
+        rewrite = direct_session._rewrite_classic_xref_as_source_stream(
+            str(output)
+        )
+        assert rewrite["object_numbers_restored"] is True
+        direct_report = direct_session._validate_preserved_structure(str(output))
+        assert direct_report["ok"] is True, direct_report["failures"]
+        source_doc = pymupdf.open(source)
+        output_doc = pymupdf.open(output)
+        try:
+            source_profile = direct_session._xref_serialization_profile(source_doc)
+            output_profile = direct_session._xref_serialization_profile(output_doc)
+            assert direct_session._trailer_ref(output_doc, "Root") == (
+                direct_session._trailer_ref(source_doc, "Root")
+            )
+            assert direct_session._trailer_ref(output_doc, "Info") == (
+                direct_session._trailer_ref(source_doc, "Info")
+            )
+            for key in (
+                "size",
+                "final_xref_object",
+                "index",
+                "compression",
+                "encoded_size",
+                "decoded_size",
+            ):
+                assert output_profile[key] == source_profile[key]
+        finally:
+            source_doc.close()
+            output_doc.close()
 
         # PDF dictionaries are unordered, but MuPDF always writes /Type first
         # in the Catalog. The reported document validly stores /Pages first.

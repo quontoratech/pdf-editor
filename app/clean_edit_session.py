@@ -38,9 +38,10 @@ class CleanEditSession:
     appearance streams, and superseded page streams are not serialized.
 
     Source Info/XMP metadata, trailer ID, xref family, and untouched page stream
-    bytes are preserved and verified. Compact garbage collection can renumber
-    indirect object references; those numbers are serialization details rather
-    than document content. No visible disclosure text is injected into pages.
+    bytes are preserved and verified. For direct-object xref-stream PDFs, new
+    edited streams are placed back into the replaced source slots so Catalog,
+    Info, page, resource and xref object numbers remain stable. No visible
+    disclosure text is injected into pages.
     """
 
   
@@ -178,6 +179,248 @@ class CleanEditSession:
                 )
         return entries
 
+    @staticmethod
+    def _remap_pdf_references(data: bytes, mapping: dict[int, int]) -> bytes:
+        """Remap ``N 0 R`` tokens without touching strings or comments."""
+        if not mapping or not data:
+            return data
+
+        protected = bytearray(len(data))
+        index = 0
+        while index < len(data):
+            value = data[index]
+            if value == 0x25:  # % comment
+                end = index
+                while end < len(data) and data[end] not in (0x0A, 0x0D):
+                    protected[end] = 1
+                    end += 1
+                index = end
+                continue
+            if value == 0x28:  # (...) literal string, including nesting
+                depth = 1
+                protected[index] = 1
+                index += 1
+                while index < len(data) and depth:
+                    protected[index] = 1
+                    if data[index] == 0x5C:  # escaped byte
+                        index += 1
+                        if index < len(data):
+                            protected[index] = 1
+                    elif data[index] == 0x28:
+                        depth += 1
+                    elif data[index] == 0x29:
+                        depth -= 1
+                    index += 1
+                continue
+            if value == 0x3C and data[index:index + 2] == b"<<":
+                # Consume both dictionary delimiters so the second ``<`` is
+                # not mistaken for the beginning of a hexadecimal string.
+                index += 2
+                continue
+            if value == 0x3C:
+                # Hexadecimal string.
+                end = index
+                while end < len(data):
+                    protected[end] = 1
+                    if data[end] == 0x3E:
+                        end += 1
+                        break
+                    end += 1
+                index = end
+                continue
+            index += 1
+
+        pattern = re.compile(rb"(?<![A-Za-z0-9])(\d+)(\s+0\s+R)(?![A-Za-z0-9])")
+        result = bytearray()
+        cursor = 0
+        for match in pattern.finditer(data):
+            if any(protected[match.start():match.end()]):
+                continue
+            old_number = int(match.group(1))
+            new_number = mapping.get(old_number)
+            if new_number is None or new_number == old_number:
+                continue
+            result.extend(data[cursor:match.start(1)])
+            result.extend(str(int(new_number)).encode("ascii"))
+            result.extend(data[match.end(1):match.end()])
+            cursor = match.end()
+        if not result:
+            return data
+        result.extend(data[cursor:])
+        return bytes(result)
+
+    @classmethod
+    def _remap_indirect_object(
+        cls,
+        section: bytes,
+        old_number: int,
+        new_number: int,
+        mapping: dict[int, int],
+    ) -> bytes:
+        """Renumber one direct object and safe indirect references in it."""
+        header = re.compile(
+            rb"^\s*" + str(int(old_number)).encode("ascii") + rb"\s+(\d+)\s+obj\b"
+        )
+        match = header.match(section)
+        if not match:
+            raise RuntimeError(
+                f"Could not locate staged object header {old_number} 0 obj."
+            )
+        generation = match.group(1)
+        rebuilt = (
+            str(int(new_number)).encode("ascii")
+            + b" "
+            + generation
+            + b" obj"
+            + section[match.end():]
+        )
+
+        stream_start = re.search(
+            rb"(?:\r\n|\r|\n)stream(?:\r\n|\r|\n)",
+            rebuilt,
+        )
+        if not stream_start:
+            return cls._remap_pdf_references(rebuilt, mapping)
+        stream_end = rebuilt.rfind(b"endstream")
+        if stream_end < stream_start.end():
+            raise RuntimeError(
+                f"Staged stream object {old_number} has no endstream marker."
+            )
+        return (
+            cls._remap_pdf_references(rebuilt[:stream_start.end()], mapping)
+            + rebuilt[stream_start.end():stream_end]
+            + cls._remap_pdf_references(rebuilt[stream_end:], mapping)
+        )
+
+    def _direct_xref_object_mapping(self, staged) -> dict[int, int] | None:
+        """Map a compact direct-object save back onto the source xref slots."""
+        source_profile = self.source_structure.get("xref_serialization", {})
+        source_xref_object = source_profile.get("final_xref_object")
+        source_size = source_profile.get("size")
+        if not source_xref_object or source_size != int(source_xref_object) + 1:
+            return None
+        if int(staged.xref_length()) != int(source_xref_object):
+            return None
+        if any(edit.get("operation_type") == "page" for edit in self.edits):
+            return None
+        source_pages = list(self.source_structure.get("pages", []))
+        if len(source_pages) != len(staged):
+            return None
+
+        edited_pages = set(self._active_edited_page_numbers(len(source_pages)))
+        source_replaced: list[int] = []
+        staged_replacements: list[int] = []
+        for page_number in sorted(edited_pages):
+            if not 1 <= page_number <= len(source_pages):
+                return None
+            old_contents = [
+                int(value)
+                for value in source_pages[page_number - 1].get("content_xrefs", [])
+            ]
+            try:
+                new_contents = [
+                    int(value) for value in staged[page_number - 1].get_contents()
+                ]
+            except Exception:
+                return None
+            if len(old_contents) != len(new_contents):
+                return None
+            source_replaced.extend(old_contents)
+            staged_replacements.extend(new_contents)
+
+        if len(set(source_replaced)) != len(source_replaced):
+            return None
+        if len(set(staged_replacements)) != len(staged_replacements):
+            return None
+
+        source_payload = list(range(1, int(source_xref_object)))
+        staged_payload = list(range(1, int(staged.xref_length())))
+        source_replaced_set = set(source_replaced)
+        staged_replacements_set = set(staged_replacements)
+        source_survivors = [
+            value for value in source_payload if value not in source_replaced_set
+        ]
+        staged_survivors = [
+            value for value in staged_payload if value not in staged_replacements_set
+        ]
+        if len(source_survivors) != len(staged_survivors):
+            return None
+
+        mapping = dict(zip(staged_survivors, source_survivors))
+        mapping.update(zip(staged_replacements, source_replaced))
+        if set(mapping) != set(staged_payload):
+            return None
+        if set(mapping.values()) != set(source_payload):
+            return None
+
+        # A compact writer can sometimes inline a resource dictionary or
+        # deduplicate a font as well as replacing page content. In that case a
+        # simple survivor-order mapping is unsafe. Require all document-tree
+        # anchors to land on their exact source slots before rewriting bytes.
+        staged_root = self._trailer_ref(staged, "Root")
+        staged_info = self._trailer_ref(staged, "Info")
+        if staged_root is None or mapping.get(staged_root) != self.source_structure.get(
+            "root_xref"
+        ):
+            return None
+        source_info = self.source_structure.get("info_xref")
+        if source_info is not None and (
+            staged_info is None or mapping.get(staged_info) != source_info
+        ):
+            return None
+        for page_number, source_page in enumerate(source_pages, start=1):
+            staged_page = staged[page_number - 1]
+            if mapping.get(int(staged_page.xref)) != int(source_page["page_xref"]):
+                return None
+            staged_contents = [
+                mapping.get(int(value)) for value in staged_page.get_contents()
+            ]
+            if staged_contents != [
+                int(value) for value in source_page.get("content_xrefs", [])
+            ]:
+                return None
+        return mapping
+
+    @staticmethod
+    def _compress_xref_to_size(decoded: bytes, target_size: int | None) -> bytes:
+        """Reproduce the source xref-stream length without changing its data.
+
+        PDF stream filters stop at the Flate end marker, so zero padding after
+        the zlib checksum is inert encoded data.  It is used only when ordinary
+        zlib settings cannot reproduce the source byte length exactly.
+        """
+        default = zlib.compress(decoded)
+        if not target_size or len(default) == int(target_size):
+            return default
+        strategies = (
+            zlib.Z_DEFAULT_STRATEGY,
+            zlib.Z_FILTERED,
+            zlib.Z_HUFFMAN_ONLY,
+            zlib.Z_RLE,
+            zlib.Z_FIXED,
+        )
+        paddable = default if len(default) < int(target_size) else None
+        for level in range(10):
+            for strategy in strategies:
+                for memory_level in range(1, 10):
+                    compressor = zlib.compressobj(
+                        level,
+                        zlib.DEFLATED,
+                        zlib.MAX_WBITS,
+                        memory_level,
+                        strategy,
+                    )
+                    candidate = compressor.compress(decoded) + compressor.flush()
+                    if len(candidate) == int(target_size):
+                        return candidate
+                    if len(candidate) < int(target_size) and (
+                        paddable is None or len(candidate) > len(paddable)
+                    ):
+                        paddable = candidate
+        if paddable is not None:
+            return paddable + (b"\0" * (int(target_size) - len(paddable)))
+        return default
+
     def _rewrite_classic_xref_as_source_stream(self, output_path: str) -> dict:
         """Emit a direct-object, Flate-compressed xref stream.
 
@@ -200,58 +443,92 @@ class CleanEditSession:
         staged = pymupdf.open(output_path)
         try:
             old_size = int(staged.xref_length())
-            trailer_parts: list[str] = []
-            excluded = {
-                "Size", "Prev", "XRefStm", "Type", "W", "Index",
-                "Length", "Filter", "DecodeParms",
+            object_mapping = self._direct_xref_object_mapping(staged)
+            object_numbers_restored = object_mapping is not None
+            if object_mapping is None:
+                object_mapping = {
+                    value: value for value in range(1, old_size)
+                }
+            staged_trailer = {
+                key: staged.xref_get_key(-1, key)
+                for key in staged.xref_get_keys(-1)
             }
-            for key in staged.xref_get_keys(-1):
-                if key in excluded:
-                    continue
-                value_type, value = staged.xref_get_key(-1, key)
-                if value_type == "null":
-                    continue
-                trailer_parts.append(f"/{key} {value}")
         finally:
             staged.close()
 
-        active_offsets = [
-            offset
-            for object_number, (offset, _generation, in_use) in entries.items()
-            if object_number > 0 and in_use
-        ]
-        if not active_offsets:
+        if not any(
+            object_number > 0 and in_use
+            for object_number, (_offset, _generation, in_use) in entries.items()
+        ):
             raise RuntimeError("The staged PDF contains no active indirect objects.")
-        first_object_offset = min(active_offsets)
 
         source_raw = Path(self.source_path).read_bytes()
         source_lines = source_raw.splitlines(keepends=True)
         if len(source_lines) < 2 or not source_lines[0].startswith(b"%PDF-"):
             raise RuntimeError("The source PDF header is malformed.")
         source_header = b"".join(source_lines[:2])
-        body = source_header + raw[first_object_offset:old_xref_offset]
-        offset_delta = len(source_header) - first_object_offset
+        ordered_objects = sorted(
+            (
+                object_mapping[object_number],
+                object_number,
+                offset,
+                generation,
+            )
+            for object_number, (offset, generation, in_use) in entries.items()
+            if object_number > 0 and in_use and object_number in object_mapping
+        )
+        staged_offsets = sorted(
+            (offset, object_number)
+            for object_number, (offset, _generation, in_use) in entries.items()
+            if object_number > 0 and in_use and object_number in object_mapping
+        )
+        end_by_object: dict[int, int] = {}
+        for position, (_offset, object_number) in enumerate(staged_offsets):
+            end_by_object[object_number] = (
+                staged_offsets[position + 1][0]
+                if position + 1 < len(staged_offsets)
+                else old_xref_offset
+            )
 
-        xref_object = old_size
+        body = bytearray(source_header)
+        object_offsets: dict[int, tuple[int, int]] = {}
+        for target_number, old_number, offset, generation in ordered_objects:
+            section = raw[offset:end_by_object[old_number]]
+            section = self._remap_indirect_object(
+                section,
+                old_number,
+                target_number,
+                object_mapping,
+            )
+            object_offsets[int(target_number)] = (len(body), int(generation))
+            body.extend(section)
+        if body and bytes(body[-1:]) not in {b"\r", b"\n"}:
+            body.extend(b"\n")
+
+        source_profile = self.source_structure.get("xref_serialization", {})
+        source_xref_object = source_profile.get("final_xref_object")
+        xref_object = (
+            int(source_xref_object)
+            if object_numbers_restored and source_xref_object is not None
+            else old_size
+        )
         new_size = xref_object + 1
+        if set(object_offsets) != set(range(1, xref_object)):
+            raise RuntimeError(
+                "The compact save cannot be placed back into every source xref slot."
+            )
         new_xref_offset = len(body)
         decoded = bytearray()
         for object_number in range(new_size):
             if object_number == xref_object:
                 entry_type, offset, generation = 1, new_xref_offset, 0
+            elif object_number in object_offsets:
+                entry_type = 1
+                offset, generation = object_offsets[object_number]
             else:
-                old_offset, old_generation, in_use = entries.get(
-                    object_number,
-                    (0, 0, False),
-                )
-                if in_use:
-                    entry_type = 1
-                    offset = old_offset + offset_delta
-                    generation = old_generation
-                else:
-                    entry_type = 0
-                    offset = old_offset
-                    generation = 255 if object_number == 0 else old_generation
+                entry_type = 0
+                offset = 0
+                generation = 255 if object_number == 0 else 0
             if not 0 <= offset <= 0xFFFFFFFF:
                 raise RuntimeError("PDF offset exceeds the four-byte xref width.")
             if not 0 <= generation <= 0xFF:
@@ -260,13 +537,68 @@ class CleanEditSession:
             decoded.extend(int(offset).to_bytes(4, "big"))
             decoded.extend(bytes((int(generation),)))
 
-        compressed = zlib.compress(bytes(decoded))
-        dictionary = (
-            "<</Type/XRef"
-            + "".join(trailer_parts)
-            + f"/Size {new_size}/W[1 4 1]/Index[0 {new_size}]"
-            + f"/Length {len(compressed)}/Filter/FlateDecode>>"
-        ).encode("latin-1")
+        source_doc = pymupdf.open(self.source_path)
+        try:
+            template_xref_object = (
+                int(source_xref_object)
+                if source_xref_object is not None
+                else xref_object
+            )
+            source_xref_keys = list(
+                source_doc.xref_get_keys(template_xref_object)
+            )
+            source_values = {
+                key: source_doc.xref_get_key(template_xref_object, key)
+                for key in source_xref_keys
+            }
+            try:
+                target_encoded_size = len(
+                    source_doc.xref_stream_raw(template_xref_object) or b""
+                )
+            except Exception:
+                target_encoded_size = None
+        finally:
+            source_doc.close()
+
+        compressed = self._compress_xref_to_size(
+            bytes(decoded),
+            target_encoded_size,
+        )
+        dictionary_parts: list[str] = []
+        handled: set[str] = set()
+        for key in source_xref_keys:
+            value_type, value = source_values[key]
+            if key in {"Prev", "XRefStm", "DecodeParms"} or value_type == "null":
+                continue
+            if key == "Size":
+                rendered = str(new_size)
+            elif key == "Length":
+                rendered = str(len(compressed))
+            elif key == "W":
+                rendered = "[1 4 1]"
+            elif key == "Type":
+                rendered = "/XRef"
+            elif key == "Filter":
+                rendered = "/FlateDecode"
+            elif not object_numbers_restored and key in staged_trailer:
+                staged_type, staged_value = staged_trailer[key]
+                if staged_type == "null":
+                    continue
+                rendered = str(staged_value)
+            else:
+                rendered = str(value)
+            dictionary_parts.append(f"/{key} {rendered}")
+            handled.add(key)
+        for key, rendered in (
+            ("Size", str(new_size)),
+            ("W", "[1 4 1]"),
+            ("Type", "/XRef"),
+            ("Filter", "/FlateDecode"),
+            ("Length", str(len(compressed))),
+        ):
+            if key not in handled:
+                dictionary_parts.append(f"/{key} {rendered}")
+        dictionary = ("<<" + "".join(dictionary_parts) + ">>").encode("latin-1")
         final_section = (
             f"{xref_object} 0 obj\n".encode("ascii")
             + dictionary
@@ -275,7 +607,7 @@ class CleanEditSession:
             + b"\nendstream\nendobj\n\n"
             + f"startxref\n{new_xref_offset}\n%%EOF\n".encode("ascii")
         )
-        rewritten = body + final_section
+        rewritten = bytes(body) + final_section
         temporary = path.with_name(path.name + ".xref-stream.tmp")
         try:
             temporary.write_bytes(rewritten)
@@ -297,6 +629,8 @@ class CleanEditSession:
             "xref_object": int(xref_object),
             "xref_filter": "/FlateDecode",
             "xref_decoded_size": int(len(decoded)),
+            "xref_encoded_size": int(len(compressed)),
+            "object_numbers_restored": bool(object_numbers_restored),
             "object_streams": 0,
             "writer_marker_removed": b"Written by MuPDF" not in rewritten,
         }
@@ -532,13 +866,28 @@ class CleanEditSession:
             xref_size = int(size_value) if size_type == "int" else None
         except Exception:
             xref_size = None
+        try:
+            index_type, index_value = doc.xref_get_key(-1, "Index")
+            xref_index = str(index_value) if index_type != "null" else None
+        except Exception:
+            xref_index = None
+        try:
+            encoded_size = (
+                len(doc.xref_stream_raw(final_xref) or b"")
+                if final_xref
+                else None
+            )
+        except Exception:
+            encoded_size = None
 
         return {
             "size": xref_size,
             "final_xref_object": final_xref,
+            "index": xref_index,
             "compression": (
                 cls._stream_filter(doc, final_xref) if final_xref else None
             ),
+            "encoded_size": encoded_size,
             "decoded_size": (
                 len(doc.xref_stream(final_xref) or b"") if final_xref else None
             ),
@@ -3031,6 +3380,15 @@ class CleanEditSession:
                 return passed
 
             source = self.source_structure
+            source_xref_profile = source.get("xref_serialization", {})
+            has_page_structure_edits = any(
+                edit.get("operation_type") == "page" for edit in self.edits
+            )
+            require_stable_direct_objects = bool(
+                source.get("xref_format") == "stream"
+                and source_xref_profile.get("object_stream_count", 0) == 0
+                and not has_page_structure_edits
+            )
             add_check(
                 "xref format",
                 source.get("xref_format"),
@@ -3045,13 +3403,13 @@ class CleanEditSession:
                 "catalog /Root reference",
                 source.get("root_xref"),
                 actual.get("root_xref"),
-                required=False,
+                required=require_stable_direct_objects,
             )
             add_check(
                 "catalog /Root object",
                 source.get("root_entries"),
                 actual.get("root_entries"),
-                required=False,
+                required=require_stable_direct_objects,
             )
             # Dictionary key order has no meaning in PDF. Keep serialization
             # drift visible for diagnostics, but do not reject an output whose
@@ -3066,7 +3424,7 @@ class CleanEditSession:
                 "Info reference",
                 source.get("info_xref"),
                 actual.get("info_xref"),
-                required=False,
+                required=require_stable_direct_objects,
             )
             add_check(
                 "Info object",
@@ -3130,11 +3488,7 @@ class CleanEditSession:
                 ),
                 actual_artifacts.get("free_xrefs", 0),
             )
-            source_xref_profile = source.get("xref_serialization", {})
             actual_xref_profile = actual.get("xref_serialization", {})
-            has_page_structure_edits = any(
-                edit.get("operation_type") == "page" for edit in self.edits
-            )
             require_direct_xref_match = bool(
                 source.get("xref_format") == "stream"
                 and source_xref_profile.get("object_stream_count", 0) == 0
@@ -3142,7 +3496,9 @@ class CleanEditSession:
             for label, key in (
                 ("xref /Size", "size"),
                 ("final xref object", "final_xref_object"),
+                ("xref /Index", "index"),
                 ("xref compression", "compression"),
+                ("xref encoded size", "encoded_size"),
                 ("xref decoded size", "decoded_size"),
                 ("object stream count", "object_stream_count"),
                 ("compressed object count", "compressed_object_count"),
@@ -3158,6 +3514,7 @@ class CleanEditSession:
                             not has_page_structure_edits
                             or key in {
                                 "compression",
+                                "index",
                                 "object_stream_count",
                                 "compressed_object_count",
                                 "writer_marker",
